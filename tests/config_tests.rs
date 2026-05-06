@@ -1,4 +1,4 @@
-use rusty_poly_bot::config::ExecutionMode;
+use rusty_poly_streak_rsi::config::ExecutionMode;
 use std::sync::{Mutex, OnceLock};
 
 /// Mutex global pour sérialiser tous les tests qui touchent les variables d'environnement.
@@ -44,7 +44,7 @@ fn test_config_from_env_defaults() {
     std::env::set_var("SYMBOL", "btcusdt");
     std::env::set_var("INTERVAL", "5m");
 
-    let config = rusty_poly_bot::config::Config::from_env().unwrap();
+    let config = rusty_poly_streak_rsi::config::Config::from_env().unwrap();
     assert_eq!(config.symbol, "btcusdt");
     assert_eq!(config.interval, "5m");
     assert_eq!(config.trade_amount_usdc, 10.0); // "__default_test__" non parseable → default
@@ -59,7 +59,7 @@ fn test_config_trade_amount_zero_uses_default() {
     let _guard = env_lock();
     std::env::set_var("EXECUTION_MODE", "__default_test__");
     std::env::set_var("TRADE_AMOUNT_USDC", "0");
-    let config = rusty_poly_bot::config::Config::from_env().unwrap();
+    let config = rusty_poly_streak_rsi::config::Config::from_env().unwrap();
     assert_eq!(config.trade_amount_usdc, 10.0);
     std::env::remove_var("EXECUTION_MODE");
     std::env::remove_var("TRADE_AMOUNT_USDC");
@@ -71,7 +71,7 @@ fn test_config_trade_amount_negative_uses_default() {
     let _guard = env_lock();
     std::env::set_var("EXECUTION_MODE", "__default_test__");
     std::env::set_var("TRADE_AMOUNT_USDC", "-50");
-    let config = rusty_poly_bot::config::Config::from_env().unwrap();
+    let config = rusty_poly_streak_rsi::config::Config::from_env().unwrap();
     assert_eq!(config.trade_amount_usdc, 10.0);
     std::env::remove_var("EXECUTION_MODE");
     std::env::remove_var("TRADE_AMOUNT_USDC");
@@ -83,7 +83,7 @@ fn test_config_trade_amount_invalid_string_uses_default() {
     let _guard = env_lock();
     std::env::set_var("EXECUTION_MODE", "__default_test__");
     std::env::set_var("TRADE_AMOUNT_USDC", "abc");
-    let config = rusty_poly_bot::config::Config::from_env().unwrap();
+    let config = rusty_poly_streak_rsi::config::Config::from_env().unwrap();
     assert_eq!(config.trade_amount_usdc, 10.0);
     std::env::remove_var("EXECUTION_MODE");
     std::env::remove_var("TRADE_AMOUNT_USDC");
@@ -94,7 +94,7 @@ fn test_config_trade_amount_invalid_string_uses_default() {
 fn test_config_unknown_execution_mode_defaults_to_dryrun() {
     let _guard = env_lock();
     std::env::set_var("EXECUTION_MODE", "MARKET"); // majuscules incorrectes
-    let config = rusty_poly_bot::config::Config::from_env().unwrap();
+    let config = rusty_poly_streak_rsi::config::Config::from_env().unwrap();
     assert!(matches!(config.execution_mode, ExecutionMode::DryRun));
     std::env::remove_var("EXECUTION_MODE");
 }
@@ -105,7 +105,7 @@ fn test_config_debug_redacts_secrets() {
     let _guard = env_lock();
     std::env::set_var("POLYMARKET_API_KEY", "super_secret_key");
     std::env::set_var("POLYMARKET_API_SECRET", "super_secret_value");
-    let config = rusty_poly_bot::config::Config::from_env().unwrap();
+    let config = rusty_poly_streak_rsi::config::Config::from_env().unwrap();
     let debug_str = format!("{:?}", config);
     assert!(!debug_str.contains("super_secret_key"), "La clé API ne doit pas apparaître dans Debug");
     assert!(!debug_str.contains("super_secret_value"), "Le secret API ne doit pas apparaître dans Debug");

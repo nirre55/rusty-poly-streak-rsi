@@ -1,4 +1,4 @@
-# rusty-poly-bot
+# rusty-poly-streak-rsi
 
 Bot de trading live en Rust pour les marchés Polymarket BTC Up/Down 5m, piloté par un signal généré depuis Binance.
 
@@ -45,7 +45,7 @@ rustup update stable
 ### 2. Cloner / préparer le projet
 
 ```bash
-cd rusty-poly-bot
+cd rusty-poly-streak-rsi
 ```
 
 ### 3. Configurer l'environnement

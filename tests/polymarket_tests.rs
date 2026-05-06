@@ -1,7 +1,7 @@
 use chrono::Utc;
-use rusty_poly_bot::config::{Config, ExecutionMode};
-use rusty_poly_bot::polymarket::{MarketInfo, PolymarketClient};
-use rusty_poly_bot::strategy::{Prediction, Signal};
+use rusty_poly_streak_rsi::config::{Config, ExecutionMode};
+use rusty_poly_streak_rsi::polymarket::{MarketInfo, PolymarketClient};
+use rusty_poly_streak_rsi::strategy::{Prediction, Signal};
 
 fn make_config(mode: ExecutionMode) -> Config {
     Config {
@@ -12,7 +12,7 @@ fn make_config(mode: ExecutionMode) -> Config {
         trade_amount_usdc: 10.0,
         polymarket_api_key: String::new(),
         polymarket_api_secret: String::new(),
-        polymarket_api_url: "https://clob.polymarket.com".to_string(),
+        polymarket_api_url: "https://clob-v2.polymarket.com".to_string(),
         logs_dir: "logs".to_string(),
         evm_private_key: None,
         polymarket_funder: None,

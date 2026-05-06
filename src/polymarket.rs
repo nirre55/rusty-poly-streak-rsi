@@ -4,17 +4,17 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkConfig};
-use polymarket_client_sdk::clob::types::{
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::clob::{Client as SdkClobClient, Config as SdkConfig};
+use polymarket_client_sdk_v2::clob::types::{
     Amount,
     OrderType as SdkOrderType,
     Side as SdkSide,
     SignatureType as SdkSignatureType,
 };
-use polymarket_client_sdk::types::Decimal;
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk_v2::types::Decimal;
+use polymarket_client_sdk_v2::POLYGON;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::Sha256;
@@ -30,7 +30,7 @@ use crate::strategy::{Prediction, Signal};
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";
-const CTF_EXCHANGE_ADDR: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const CTF_EXCHANGE_ADDR: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 const POLYGON_CHAIN_ID: u64 = 137;
 const CLOB_AUTH_MSG: &str = "This message attests that I control the given wallet";
 const FOK_RETRY_DELAYS_SECS: [u64; 3] = [3, 7, 10];
@@ -263,9 +263,10 @@ impl PolymarketClient {
         // Pré-fetch tick_size + fee_rate_bps + neg_risk pour les deux tokens (UP et DOWN).
         // Les erreurs sont ignorées — ce n'est qu'un warm-up.
         for token_id in [&market.up_token_id, &market.down_token_id] {
-            let _ = client.tick_size(token_id).await;
-            let _ = client.fee_rate_bps(token_id).await;
-            let _ = client.neg_risk(token_id).await;
+            if let Ok(tid) = U256::from_str_radix(token_id.as_str(), 10) {
+                let _ = client.tick_size(tid).await;
+                let _ = client.neg_risk(tid).await;
+            }
         }
     }
 
@@ -441,7 +442,7 @@ impl PolymarketClient {
             b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
         );
         let name_hash = keccak256(b"Polymarket CTF Exchange");
-        let version_hash = keccak256(b"1");
+        let version_hash = keccak256(b"2");
         let contract = Address::from_str(CTF_EXCHANGE_ADDR)
             .map_err(|_| anyhow!("adresse CTFExchange invalide"))?;
 
@@ -666,10 +667,13 @@ impl PolymarketClient {
         let max_price = Decimal::from_str("0.99")
             .map_err(|e| anyhow!("prix max Decimal invalide: {}", e))?;
 
+        let token_id_u256 = U256::from_str_radix(token_id_str, 10)
+            .map_err(|e| anyhow!("token_id parse U256: {}", e))?;
+
         let t1 = Instant::now();
         let order = client
             .market_order()
-            .token_id(token_id_str)
+            .token_id(token_id_u256)
             .amount(Amount::usdc(amount).map_err(|e| anyhow!("Amount::usdc: {}", e))?)
             .price(max_price)
             .side(SdkSide::Buy)

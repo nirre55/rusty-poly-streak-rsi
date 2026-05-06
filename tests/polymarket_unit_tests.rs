@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, B256, U256};
 use base64::engine::general_purpose::URL_SAFE;
 use base64::Engine;
-use rusty_poly_bot::polymarket::PolymarketClient;
+use rusty_poly_streak_rsi::polymarket::PolymarketClient;
 use std::str::FromStr;
 
 #[test]

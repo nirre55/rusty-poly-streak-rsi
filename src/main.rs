@@ -5,16 +5,16 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use rusty_poly_bot::binance::{self, Candle};
-use rusty_poly_bot::config::Config;
-use rusty_poly_bot::logger::{
+use rusty_poly_streak_rsi::binance::{self, Candle};
+use rusty_poly_streak_rsi::config::Config;
+use rusty_poly_streak_rsi::logger::{
     log_candle_close, log_order_ack, log_order_sent, log_signal_detected, TradeLogger, TradeRecord,
 };
-use rusty_poly_bot::money::MoneyManager;
-use rusty_poly_bot::polymarket::PolymarketClient;
-use rusty_poly_bot::strategies::three_candle_rsi7_reversal::ThreeCandleRsi7Reversal;
-use rusty_poly_bot::strategy::{Prediction, Strategy};
-use rusty_poly_bot::tracker::{build_signal_key, PositionTracker};
+use rusty_poly_streak_rsi::money::MoneyManager;
+use rusty_poly_streak_rsi::polymarket::PolymarketClient;
+use rusty_poly_streak_rsi::strategies::three_candle_rsi7_reversal::ThreeCandleRsi7Reversal;
+use rusty_poly_streak_rsi::strategy::{Prediction, Strategy};
+use rusty_poly_streak_rsi::tracker::{build_signal_key, PositionTracker};
 
 fn parse_interval_duration(interval: &str) -> Result<Duration> {
     if interval.len() < 2 {
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let interval_duration = parse_interval_duration(&config.interval)?;
     info!(
-        "Démarrage rusty-poly-bot | mode={:?} symbol={} interval={} strategy={} rsi=[{},{}]",
+        "Démarrage rusty-poly-streak-rsi | mode={:?} symbol={} interval={} strategy={} rsi=[{},{}]",
         config.execution_mode, config.symbol, config.interval,
         config.strategy, config.rsi_oversold, config.rsi_overbought
     );
