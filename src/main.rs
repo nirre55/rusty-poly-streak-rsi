@@ -1,12 +1,12 @@
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::{Datelike, Duration, Timelike, Utc, Weekday};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use rusty_poly_streak_rsi::binance::{self, Candle};
-use rusty_poly_streak_rsi::config::Config;
+use rusty_poly_streak_rsi::config::{Config, ExecutionMode};
 use rusty_poly_streak_rsi::logger::{
     log_candle_close, log_order_ack, log_order_sent, log_signal_detected, TradeLogger, TradeRecord,
 };
@@ -89,8 +89,30 @@ async fn main() -> Result<()> {
     let mut active_strategy = create_strategy(&config)?;
 
     // Money manager : Martingale progressive
+    let initial_base_amount = if config.trade_amount_pct > 0.0
+        && !matches!(config.execution_mode, ExecutionMode::DryRun)
+    {
+        match poly_client.get_usdc_balance().await {
+            Ok(balance) => {
+                let amount = (balance * config.trade_amount_pct / 100.0 * 100.0).floor() / 100.0;
+                let amount = amount.max(1.0);
+                info!(
+                    "[MONEY] Solde USDC = {:.2} | {:.1}% = {:.2} USDC (min 1$)",
+                    balance, config.trade_amount_pct, amount
+                );
+                amount
+            }
+            Err(e) => {
+                warn!("[MONEY] Impossible de récupérer le solde USDC pour TRADE_AMOUNT_PCT ({}), fallback {:.2} USDC", e, config.trade_amount_usdc);
+                config.trade_amount_usdc
+            }
+        }
+    } else {
+        config.trade_amount_usdc
+    };
+
     let money_manager = Arc::new(tokio::sync::Mutex::new(MoneyManager::new(
-        config.trade_amount_usdc,
+        initial_base_amount,
         config.martingale_multiplier,
         config.martingale_max_amount,
         &config.logs_dir,
@@ -99,17 +121,23 @@ async fn main() -> Result<()> {
         let mm = money_manager.lock().await;
         info!(
             "Martingale activée | base={:.2} USDC multiplier={:.2} montant_courant={:.2} USDC (losses={})",
-            config.trade_amount_usdc, config.martingale_multiplier,
+            initial_base_amount, config.martingale_multiplier,
             mm.current_amount(), mm.consecutive_losses()
         );
     }
 
     // Tracker V3 : suit les ordres ouverts et met à jour outcome dans le CSV
+    let tracker_pct = if matches!(config.execution_mode, ExecutionMode::DryRun) {
+        0.0
+    } else {
+        config.trade_amount_pct
+    };
     let tracker = Arc::new(PositionTracker::new(
         poly_client.clone(),
         trade_logger.clone(),
         money_manager.clone(),
         &config.logs_dir,
+        tracker_pct,
     ));
     tokio::spawn({
         let tracker = tracker.clone();
@@ -193,6 +221,36 @@ async fn main() -> Result<()> {
             &signal.prediction.to_string(),
             signal.rsi,
         );
+
+        // ── Filtre jour de la semaine ────────────────────────────────────────
+        if !config.excluded_days.is_empty() {
+            let day_str = match candle.close_time.weekday() {
+                Weekday::Mon => "mon",
+                Weekday::Tue => "tue",
+                Weekday::Wed => "wed",
+                Weekday::Thu => "thu",
+                Weekday::Fri => "fri",
+                Weekday::Sat => "sat",
+                Weekday::Sun => "sun",
+            };
+            if config.excluded_days.iter().any(|d| d == day_str) {
+                info!("[FILTRE JOUR] {} — trading désactivé ce jour", day_str);
+                tracker.validate_with_closed_candle(candle.close_time, candle.is_green()).await;
+                spawn_prefetch_next_market(&poly_client, candle.close_time, interval_duration, &config.polymarket_slug_prefix);
+                continue;
+            }
+        }
+
+        // ── Filtre heure (UTC) ───────────────────────────────────────────────
+        if !config.excluded_hours.is_empty() {
+            let hour = candle.close_time.hour();
+            if config.excluded_hours.iter().any(|&(start, end)| hour >= start && hour < end) {
+                info!("[FILTRE HEURE] {}h UTC — trading désactivé sur cette plage horaire", hour);
+                tracker.validate_with_closed_candle(candle.close_time, candle.is_green()).await;
+                spawn_prefetch_next_market(&poly_client, candle.close_time, interval_duration, &config.polymarket_slug_prefix);
+                continue;
+            }
+        }
 
         let target_close_time = candle.close_time + interval_duration;
         let signal_key = build_signal_key(&signal.strategy_name, &slug, &signal.prediction);

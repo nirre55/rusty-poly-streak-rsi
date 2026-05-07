@@ -52,6 +52,13 @@ pub struct Config {
     pub martingale_multiplier: f64,
     /// Montant maximum Martingale en USDC. 0.0 = pas de plafond. Défaut: 0.0
     pub martingale_max_amount: f64,
+    /// Pourcentage du solde USDC à miser par trade. 0.0 = désactivé (utilise trade_amount_usdc).
+    /// Mutuellement exclusif avec TRADE_AMOUNT_USDC. Minimum 1$ appliqué. Défaut: 0.0
+    pub trade_amount_pct: f64,
+    /// Jours de la semaine exclus du trading (ex: ["sat", "sun"]). Vide = aucun filtre.
+    pub excluded_days: Vec<String>,
+    /// Plages horaires UTC exclues du trading (ex: [(0, 9)]). Vide = aucun filtre.
+    pub excluded_hours: Vec<(u32, u32)>,
 }
 
 impl std::fmt::Debug for Config {
@@ -75,6 +82,9 @@ impl std::fmt::Debug for Config {
             .field("polymarket_slug_prefix", &self.polymarket_slug_prefix)
             .field("martingale_multiplier", &self.martingale_multiplier)
             .field("martingale_max_amount", &self.martingale_max_amount)
+            .field("trade_amount_pct", &self.trade_amount_pct)
+            .field("excluded_days", &self.excluded_days)
+            .field("excluded_hours", &self.excluded_hours)
             .finish()
     }
 }
@@ -97,6 +107,22 @@ impl Config {
                 ExecutionMode::DryRun
             }
         };
+
+        let trade_amount_pct = env::var("TRADE_AMOUNT_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if trade_amount_pct != 0.0 {
+            if !(0.0 < trade_amount_pct && trade_amount_pct <= 100.0) {
+                anyhow::bail!(
+                    "TRADE_AMOUNT_PCT={} invalide — doit être entre 0 et 100 exclus",
+                    trade_amount_pct
+                );
+            }
+            if env::var("TRADE_AMOUNT_USDC").is_ok() {
+                anyhow::bail!("TRADE_AMOUNT_PCT et TRADE_AMOUNT_USDC sont mutuellement exclusifs — n'utiliser qu'un seul");
+            }
+        }
 
         // P11 : valider que TRADE_AMOUNT_USDC est un nombre strictement positif
         let raw_amount = env::var("TRADE_AMOUNT_USDC").unwrap_or_else(|_| "10.0".to_string());
@@ -158,6 +184,32 @@ impl Config {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(35.0);
 
+        let excluded_days = env::var("EXCLUDED_DAYS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let excluded_hours: Vec<(u32, u32)> = env::var("EXCLUDED_HOURS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|range| {
+                let range = range.trim();
+                if range.is_empty() { return None; }
+                let parts: Vec<&str> = range.splitn(2, '-').collect();
+                if parts.len() != 2 { return None; }
+                let parse_h = |s: &str| s.trim().trim_end_matches('h').parse::<u32>().ok();
+                let start = parse_h(parts[0])?;
+                let end = parse_h(parts[1])?;
+                if start >= end || end > 24 {
+                    warn!("EXCLUDED_HOURS: plage invalide '{}' ignorée", range);
+                    return None;
+                }
+                Some((start, end))
+            })
+            .collect();
+
         Ok(Config {
             binance_ws_url: env::var("BINANCE_WS_URL")
                 .unwrap_or_else(|_| "wss://stream.binance.com:9443/ws".to_string()),
@@ -181,6 +233,9 @@ impl Config {
                 .unwrap_or_else(|_| "btc-updown-5m".to_string()),
             martingale_multiplier,
             martingale_max_amount,
+            trade_amount_pct,
+            excluded_days,
+            excluded_hours,
         })
     }
 }

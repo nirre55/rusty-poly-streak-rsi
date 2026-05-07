@@ -58,6 +58,10 @@ impl MoneyManager {
         }
     }
 
+    pub fn set_base_amount(&mut self, amount: f64) {
+        self.base_amount = amount;
+    }
+
     /// Nombre de losses consécutifs en cours.
     pub fn consecutive_losses(&self) -> u32 {
         self.consecutive_losses

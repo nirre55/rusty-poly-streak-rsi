@@ -9,10 +9,12 @@ use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::{Client as SdkClobClient, Config as SdkConfig};
 use polymarket_client_sdk_v2::clob::types::{
     Amount,
+    AssetType,
     OrderType as SdkOrderType,
     Side as SdkSide,
     SignatureType as SdkSignatureType,
 };
+use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::types::Decimal;
 use polymarket_client_sdk_v2::POLYGON;
 use serde::{Deserialize, Serialize};
@@ -744,5 +746,19 @@ impl PolymarketClient {
         let msg = err.to_string().to_ascii_lowercase();
         msg.contains("fok orders are fully filled or killed")
             || msg.contains("order couldn't be fully filled")
+    }
+
+    pub async fn get_usdc_balance(&self) -> Result<f64> {
+        let client = self.get_or_create_sdk_client().await?;
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        let _ = client.update_balance_allowance(req.clone()).await;
+        let resp = client
+            .balance_allowance(req)
+            .await
+            .map_err(|e| anyhow!("get_usdc_balance échoué: {}", e))?;
+        let raw: f64 = resp.balance.to_string().parse().unwrap_or(0.0);
+        Ok((raw / 1_000_000.0 * 100.0).floor() / 100.0)
     }
 }

@@ -47,10 +47,11 @@ pub struct PositionTracker {
     logger: Arc<TradeLogger>,
     money: Arc<tokio::sync::Mutex<MoneyManager>>,
     state_path: PathBuf,
+    trade_amount_pct: f64,
 }
 
 impl PositionTracker {
-    pub fn new(client: Arc<PolymarketClient>, logger: Arc<TradeLogger>, money: Arc<tokio::sync::Mutex<MoneyManager>>, logs_dir: &str) -> Self {
+    pub fn new(client: Arc<PolymarketClient>, logger: Arc<TradeLogger>, money: Arc<tokio::sync::Mutex<MoneyManager>>, logs_dir: &str, trade_amount_pct: f64) -> Self {
         let state_path = PathBuf::from(logs_dir).join("pending_orders.json");
         let pending = Self::load_pending(&state_path);
         if !pending.is_empty() {
@@ -66,6 +67,7 @@ impl PositionTracker {
             logger,
             money,
             state_path,
+            trade_amount_pct,
         }
     }
 
@@ -152,6 +154,30 @@ impl PositionTracker {
                         trade.trade_id, outcome
                     );
                     self.money.lock().await.on_outcome(&outcome);
+                    if self.trade_amount_pct > 0.0 && matches!(outcome.as_str(), "WIN" | "LOSS") {
+                        let client = self.client.clone();
+                        let money = self.money.clone();
+                        let pct = self.trade_amount_pct;
+                        tokio::spawn(async move {
+                            for delay_ms in [300u64, 700, 1500] {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                match client.get_usdc_balance().await {
+                                    Ok(balance) if balance > 0.0 => {
+                                        let amount = (balance * pct / 100.0 * 100.0).floor() / 100.0;
+                                        let amount = amount.max(1.0);
+                                        info!("[MONEY] Balance post-trade: {:.2}$ → prochain montant = {:.2}$", balance, amount);
+                                        money.lock().await.set_base_amount(amount);
+                                        return;
+                                    }
+                                    Ok(_) => warn!("[MONEY] Balance USDC encore 0 après {}ms, retry…", delay_ms),
+                                    Err(e) => {
+                                        warn!("[MONEY] Balance refresh post-trade échoué: {}", e);
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
                     trade.validation_done = true;
                     changed = true;
                 }
