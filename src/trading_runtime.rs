@@ -1,0 +1,322 @@
+use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use crate::binance::Candle;
+use crate::config::Config;
+use crate::logger::{
+    log_candle_close, log_order_ack, log_order_sent, log_signal_detected, CandleCloseLog,
+    PendingBuyTradeRecord, TradeLogger, TradeRecord,
+};
+use crate::money::MoneyManager;
+use crate::polymarket::{MarketInfo, OrderResult, PolymarketClient};
+use crate::strategy::{Prediction, Signal, Strategy};
+use crate::tracker::{build_signal_key, PositionTracker};
+use crate::trade_timing::TradeLatencies;
+use crate::trading_filter::{trading_filter_reason, TradingFilterReason};
+
+type PolymarketTradingFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+pub trait PolymarketTradingClient: Send + Sync {
+    fn resolve_market<'a>(&'a self, slug: &'a str) -> PolymarketTradingFuture<'a, MarketInfo>;
+
+    fn place_order<'a>(
+        &'a self,
+        signal: &'a Signal,
+        market: &'a MarketInfo,
+        amount_usdc: f64,
+    ) -> PolymarketTradingFuture<'a, OrderResult>;
+
+    fn warm_sdk_caches<'a>(&'a self, market: &'a MarketInfo) -> PolymarketTradingFuture<'a, ()>;
+}
+
+impl PolymarketTradingClient for PolymarketClient {
+    fn resolve_market<'a>(&'a self, slug: &'a str) -> PolymarketTradingFuture<'a, MarketInfo> {
+        Box::pin(async move { PolymarketClient::resolve_market(self, slug).await })
+    }
+
+    fn place_order<'a>(
+        &'a self,
+        signal: &'a Signal,
+        market: &'a MarketInfo,
+        amount_usdc: f64,
+    ) -> PolymarketTradingFuture<'a, OrderResult> {
+        Box::pin(
+            async move { PolymarketClient::place_order(self, signal, market, amount_usdc).await },
+        )
+    }
+
+    fn warm_sdk_caches<'a>(&'a self, market: &'a MarketInfo) -> PolymarketTradingFuture<'a, ()> {
+        Box::pin(async move {
+            PolymarketClient::warm_sdk_caches(self, market).await;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedCandleAction {
+    NoSignal,
+    Filtered,
+    DuplicateSignal,
+    MarketResolveFailed,
+    OrderFailed,
+    OrderPlaced {
+        trade_id: String,
+        signal_key: String,
+    },
+}
+
+pub struct RuntimeState {
+    pub trade_logger: Arc<TradeLogger>,
+    pub poly_client: Arc<dyn PolymarketTradingClient>,
+    pub money_manager: Arc<tokio::sync::Mutex<MoneyManager>>,
+    pub tracker: Arc<PositionTracker>,
+}
+
+pub fn spawn_prefetch_next_market(
+    poly_client: &Arc<dyn PolymarketTradingClient>,
+    close_time: DateTime<Utc>,
+    interval_duration: Duration,
+    slug_prefix: &str,
+) {
+    let poly = poly_client.clone();
+    let future_open_ms =
+        (close_time + interval_duration + chrono::Duration::milliseconds(1)).timestamp_millis();
+    let future_slug = PolymarketClient::build_slug(slug_prefix, future_open_ms);
+    tokio::spawn(async move {
+        if let Ok(market) = poly.resolve_market(&future_slug).await {
+            let _ = poly.warm_sdk_caches(&market).await;
+        }
+    });
+}
+
+async fn validate_and_prefetch_next_market(
+    state: &RuntimeState,
+    candle: &Candle,
+    interval_duration: Duration,
+    slug_prefix: &str,
+) {
+    state
+        .tracker
+        .validate_with_closed_candle(candle.close_time, candle.is_green())
+        .await;
+    spawn_prefetch_next_market(
+        &state.poly_client,
+        candle.close_time,
+        interval_duration,
+        slug_prefix,
+    );
+}
+
+async fn should_skip_duplicate_signal(
+    state: &RuntimeState,
+    signal_key: &str,
+    candle: &Candle,
+) -> bool {
+    if state.tracker.is_signal_active(signal_key).await {
+        warn!(
+            "Signal deja en cours de suivi - ordre ignore | signal_key={}",
+            signal_key
+        );
+        state
+            .tracker
+            .validate_with_closed_candle(candle.close_time, candle.is_green())
+            .await;
+        return true;
+    }
+
+    match state.trade_logger.has_signal_key(signal_key) {
+        Ok(true) => {
+            warn!(
+                "Signal deja execute precedemment - ordre ignore | signal_key={}",
+                signal_key
+            );
+            state
+                .tracker
+                .validate_with_closed_candle(candle.close_time, candle.is_green())
+                .await;
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(
+                "Impossible de verifier l'historique des signaux ({}), poursuite prudente",
+                e
+            );
+            false
+        }
+    }
+}
+
+pub async fn process_closed_candle(
+    config: &Config,
+    interval_duration: Duration,
+    strategy: &mut dyn Strategy,
+    state: &RuntimeState,
+    candle: &Candle,
+) -> ClosedCandleAction {
+    let signal_received_at = Utc::now();
+    let signal = strategy.on_closed_candle(candle);
+
+    let color = if candle.is_green() { "VERT" } else { "ROUGE" };
+    let candle_log_extras = strategy.candle_log_extras();
+    log_candle_close(CandleCloseLog {
+        symbol: &config.symbol,
+        interval: &config.interval,
+        candle_high: candle.high,
+        candle_low: candle.low,
+        candle_open: candle.open,
+        close: candle.close,
+        color,
+        extras: &candle_log_extras,
+        close_time: &candle.close_time,
+    });
+
+    let next_open_ms = (candle.close_time + chrono::Duration::milliseconds(1)).timestamp_millis();
+    let slug = PolymarketClient::build_slug(&config.polymarket_slug_prefix, next_open_ms);
+
+    let Some(signal) = signal else {
+        validate_and_prefetch_next_market(
+            state,
+            candle,
+            interval_duration,
+            &config.polymarket_slug_prefix,
+        )
+        .await;
+        return ClosedCandleAction::NoSignal;
+    };
+
+    log_signal_detected(
+        &signal.strategy_name,
+        &signal.prediction.to_string(),
+        signal.rsi,
+    );
+
+    if let Some(reason) = trading_filter_reason(
+        candle.close_time,
+        &config.excluded_days,
+        &config.excluded_hours,
+    ) {
+        match reason {
+            TradingFilterReason::ExcludedDay(day) => {
+                info!("[FILTRE JOUR] {} - trading desactive ce jour", day);
+            }
+            TradingFilterReason::ExcludedHour(hour) => {
+                info!(
+                    "[FILTRE HEURE] {}h UTC - trading desactive sur cette plage horaire",
+                    hour
+                );
+            }
+        }
+        validate_and_prefetch_next_market(
+            state,
+            candle,
+            interval_duration,
+            &config.polymarket_slug_prefix,
+        )
+        .await;
+        return ClosedCandleAction::Filtered;
+    }
+
+    let target_close_time = candle.close_time + interval_duration;
+    let signal_key = build_signal_key(&signal.strategy_name, &slug, &signal.prediction);
+
+    if should_skip_duplicate_signal(state, &signal_key, candle).await {
+        return ClosedCandleAction::DuplicateSignal;
+    }
+
+    let market = match state.poly_client.resolve_market(&slug).await {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Impossible de resoudre le marche Polymarket: {}", e);
+            state
+                .tracker
+                .validate_with_closed_candle(candle.close_time, candle.is_green())
+                .await;
+            return ClosedCandleAction::MarketResolveFailed;
+        }
+    };
+
+    let trade_amount = state.money_manager.lock().await.current_amount();
+    let order_submit_started_at = Utc::now();
+
+    let order_result = match state
+        .poly_client
+        .place_order(&signal, &market, trade_amount)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Erreur lors de l'envoi de l'ordre: {}", e);
+            return ClosedCandleAction::OrderFailed;
+        }
+    };
+
+    let latencies = TradeLatencies::from_times(
+        signal_received_at,
+        order_submit_started_at,
+        order_result.ack_at,
+        candle.close_time,
+    );
+
+    let token_id = match &signal.prediction {
+        Prediction::Up => &market.up_token_id,
+        Prediction::Down => &market.down_token_id,
+    };
+
+    log_order_sent(&order_result.order_id, token_id, trade_amount);
+    log_order_ack(
+        &order_result.order_id,
+        &order_result.status,
+        latencies.signal_to_ack_ms,
+    );
+
+    let trade_id = Uuid::new_v4().to_string();
+    let prediction = signal.prediction.to_string();
+    let record = TradeRecord::pending_buy(PendingBuyTradeRecord {
+        trade_id: &trade_id,
+        signal_key: &signal_key,
+        symbol: &config.symbol,
+        interval: &config.interval,
+        signal_close_time_utc: &signal.signal_candle_close_time,
+        target_candle_open_time_utc: &candle.close_time,
+        prediction: &prediction,
+        entry_order_type: config.execution_mode.as_str(),
+        order_status: &order_result.status,
+        latencies,
+    });
+
+    if let Err(e) = state.trade_logger.log_trade(&record) {
+        error!("Erreur lors de l'enregistrement du trade: {}", e);
+    }
+
+    state
+        .tracker
+        .track(
+            trade_id.clone(),
+            order_result.order_id,
+            signal_key.clone(),
+            signal.prediction.clone(),
+            target_close_time,
+            order_result.status.clone(),
+        )
+        .await;
+
+    validate_and_prefetch_next_market(
+        state,
+        candle,
+        interval_duration,
+        &config.polymarket_slug_prefix,
+    )
+    .await;
+
+    ClosedCandleAction::OrderPlaced {
+        trade_id,
+        signal_key,
+    }
+}

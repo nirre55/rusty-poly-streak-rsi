@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::info;
 
+use crate::trade_timing::TradeLatencies;
+
 #[derive(Debug, Serialize)]
 pub struct TradeRecord {
     pub trade_id: String,
@@ -25,6 +27,41 @@ pub struct TradeRecord {
     pub signal_to_ack_ms: i64,
     pub trade_open_to_order_ack_ms: i64,
     pub outcome: String,
+}
+
+pub struct PendingBuyTradeRecord<'a> {
+    pub trade_id: &'a str,
+    pub signal_key: &'a str,
+    pub symbol: &'a str,
+    pub interval: &'a str,
+    pub signal_close_time_utc: &'a DateTime<Utc>,
+    pub target_candle_open_time_utc: &'a DateTime<Utc>,
+    pub prediction: &'a str,
+    pub entry_order_type: &'a str,
+    pub order_status: &'a str,
+    pub latencies: TradeLatencies,
+}
+
+impl TradeRecord {
+    pub fn pending_buy(input: PendingBuyTradeRecord<'_>) -> Self {
+        Self {
+            trade_id: input.trade_id.to_string(),
+            signal_key: input.signal_key.to_string(),
+            symbol: input.symbol.to_string(),
+            interval: input.interval.to_string(),
+            signal_close_time_utc: input.signal_close_time_utc.to_rfc3339(),
+            target_candle_open_time_utc: input.target_candle_open_time_utc.to_rfc3339(),
+            prediction: input.prediction.to_string(),
+            entry_side: "BUY".to_string(),
+            entry_order_type: input.entry_order_type.to_string(),
+            order_status: input.order_status.to_string(),
+            signal_to_submit_start_ms: input.latencies.signal_to_submit_start_ms,
+            submit_start_to_ack_ms: input.latencies.submit_start_to_ack_ms,
+            signal_to_ack_ms: input.latencies.signal_to_ack_ms,
+            trade_open_to_order_ack_ms: input.latencies.trade_open_to_order_ack_ms,
+            outcome: "PENDING".to_string(),
+        }
+    }
 }
 
 pub struct TradeLogger {
@@ -52,7 +89,7 @@ impl TradeLogger {
                 .truncate(true)
                 .open(&csv_path)?;
             let mut wtr = WriterBuilder::new().has_headers(true).from_writer(file);
-            wtr.write_record(&[
+            wtr.write_record([
                 "trade_id",
                 "signal_key",
                 "symbol",
@@ -81,7 +118,10 @@ impl TradeLogger {
     }
 
     pub fn has_signal_key(&self, signal_key: &str) -> Result<bool> {
-        let _guard = self.lock.lock().map_err(|e| anyhow!("CSV lock poisoned: {}", e))?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|e| anyhow!("CSV lock poisoned: {}", e))?;
         if !self.csv_path.exists() {
             return Ok(false);
         }
@@ -118,7 +158,10 @@ impl TradeLogger {
     }
 
     fn update_trade_field(&self, trade_id: &str, column_name: &str, new_value: &str) -> Result<()> {
-        let _guard = self.lock.lock().map_err(|e| anyhow!("CSV lock poisoned: {}", e))?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|e| anyhow!("CSV lock poisoned: {}", e))?;
         let content = fs::read_to_string(&self.csv_path)?;
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(true)
@@ -203,7 +246,8 @@ impl TradeLogger {
         let mut migrated_rows = Vec::new();
         for record in rdr.records() {
             let record = record?;
-            let migrated = Self::migrate_record_to_current_schema(&record, old_header_len, new_header_len);
+            let migrated =
+                Self::migrate_record_to_current_schema(&record, old_header_len, new_header_len);
             migrated_rows.push(migrated);
         }
 
@@ -214,7 +258,7 @@ impl TradeLogger {
             .truncate(true)
             .open(&tmp_path)?;
         let mut wtr = WriterBuilder::new().has_headers(false).from_writer(file);
-        wtr.write_record(&new_headers)?;
+        wtr.write_record(new_headers)?;
         for row in migrated_rows {
             wtr.write_record(row)?;
         }
@@ -222,7 +266,10 @@ impl TradeLogger {
         drop(wtr);
 
         fs::rename(&tmp_path, csv_path)?;
-        info!("Migration CSV effectuée | fichier={} -> schéma avec signal_key", csv_path.display());
+        info!(
+            "Migration CSV effectuée | fichier={} -> schéma avec signal_key",
+            csv_path.display()
+        );
         Ok(())
     }
 
@@ -268,7 +315,10 @@ impl TradeLogger {
     }
 
     pub fn log_trade(&self, record: &TradeRecord) -> Result<()> {
-        let _guard = self.lock.lock().map_err(|e| anyhow!("CSV lock poisoned: {}", e))?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|e| anyhow!("CSV lock poisoned: {}", e))?;
         let file = OpenOptions::new().append(true).open(&self.csv_path)?;
         let mut wtr = WriterBuilder::new().has_headers(false).from_writer(file);
         wtr.serialize(record)?;
@@ -283,33 +333,38 @@ impl TradeLogger {
 
 // --- Fonctions de log console ---
 
-pub fn log_candle_close(
-    symbol: &str,
-    interval: &str,
-    candle_high: f64,
-    candle_low: f64,
-    candle_open: f64,
-    close: f64,
-    color: &str,
-    extras: &str,
-    close_time: &DateTime<Utc>,
-) {
-    let range = candle_high - candle_low;
+pub struct CandleCloseLog<'a> {
+    pub symbol: &'a str,
+    pub interval: &'a str,
+    pub candle_high: f64,
+    pub candle_low: f64,
+    pub candle_open: f64,
+    pub close: f64,
+    pub color: &'a str,
+    pub extras: &'a str,
+    pub close_time: &'a DateTime<Utc>,
+}
+
+pub fn log_candle_close(event: CandleCloseLog<'_>) {
+    let range = event.candle_high - event.candle_low;
     let body_str = if range > 0.0 {
-        format!("{:.0}%", (close - candle_open).abs() / range * 100.0)
+        format!(
+            "{:.0}%",
+            (event.close - event.candle_open).abs() / range * 100.0
+        )
     } else {
         "N/A".to_string()
     };
     info!(
         "[BOUGIE FERMÉE] {} {} | close={:.2} {} | {} | range={:.2} | body={} | {}",
-        symbol,
-        interval,
-        close,
-        color,
-        extras,
+        event.symbol,
+        event.interval,
+        event.close,
+        event.color,
+        event.extras,
         range,
         body_str,
-        close_time.format("%Y-%m-%d %H:%M:%S UTC")
+        event.close_time.format("%Y-%m-%d %H:%M:%S UTC")
     );
 }
 

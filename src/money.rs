@@ -34,10 +34,7 @@ impl MoneyManager {
             );
         }
         if max_amount > 0.0 {
-            info!(
-                "[MONEY] Plafond Martingale = {:.2} USDC",
-                max_amount
-            );
+            info!("[MONEY] Plafond Martingale = {:.2} USDC", max_amount);
         }
         Self {
             base_amount,

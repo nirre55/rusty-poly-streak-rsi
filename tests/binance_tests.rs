@@ -56,8 +56,12 @@ fn test_candle_doji_counted_as_green() {
 #[test]
 fn test_parse_klines_valid() {
     let rows = vec![
-        make_kline_row(1_000_000, 1_299_999, "100.0", "110.0", "90.0", "105.0", "500.0"),
-        make_kline_row(1_300_000, 1_599_999, "105.0", "115.0", "95.0", "95.0", "600.0"),
+        make_kline_row(
+            1_000_000, 1_299_999, "100.0", "110.0", "90.0", "105.0", "500.0",
+        ),
+        make_kline_row(
+            1_300_000, 1_599_999, "105.0", "115.0", "95.0", "95.0", "600.0",
+        ),
     ];
     let candles = parse_klines(rows);
     assert_eq!(candles.len(), 2);
@@ -79,7 +83,9 @@ fn test_parse_klines_ignores_malformed_rows() {
         json!("not an array"),
         json!(null),
         json!([1_000_000]), // tableau trop court
-        make_kline_row(1_000_000, 1_299_999, "100.0", "110.0", "90.0", "105.0", "500.0"),
+        make_kline_row(
+            1_000_000, 1_299_999, "100.0", "110.0", "90.0", "105.0", "500.0",
+        ),
     ];
     let candles = parse_klines(rows);
     assert_eq!(candles.len(), 1, "Seule la ligne valide doit être parsée");
@@ -107,11 +113,30 @@ fn test_parse_klines_timestamps() {
 fn test_parse_klines_invalid_timestamp_skipped() {
     let bad_ts = i64::MAX; // hors plage DateTime
     let rows = vec![
-        json!([bad_ts, "100.0", "110.0", "90.0", "105.0", "500.0", 1_299_999i64, "0", 0, "0", "0", "0"]),
-        make_kline_row(1_000_000, 1_299_999, "100.0", "110.0", "90.0", "105.0", "500.0"),
+        json!([
+            bad_ts,
+            "100.0",
+            "110.0",
+            "90.0",
+            "105.0",
+            "500.0",
+            1_299_999i64,
+            "0",
+            0,
+            "0",
+            "0",
+            "0"
+        ]),
+        make_kline_row(
+            1_000_000, 1_299_999, "100.0", "110.0", "90.0", "105.0", "500.0",
+        ),
     ];
     let candles = parse_klines(rows);
-    assert_eq!(candles.len(), 1, "La bougie avec timestamp invalide doit être ignorée");
+    assert_eq!(
+        candles.len(),
+        1,
+        "La bougie avec timestamp invalide doit être ignorée"
+    );
     assert_ne!(
         candles[0].open_time.timestamp_millis(),
         0,

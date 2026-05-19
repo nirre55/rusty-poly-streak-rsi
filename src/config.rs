@@ -204,9 +204,13 @@ impl Config {
             .split(',')
             .filter_map(|range| {
                 let range = range.trim();
-                if range.is_empty() { return None; }
+                if range.is_empty() {
+                    return None;
+                }
                 let parts: Vec<&str> = range.splitn(2, '-').collect();
-                if parts.len() != 2 { return None; }
+                if parts.len() != 2 {
+                    return None;
+                }
                 let parse_h = |s: &str| s.trim().trim_end_matches('h').parse::<u32>().ok();
                 let start = parse_h(parts[0])?;
                 let end = parse_h(parts[1])?;

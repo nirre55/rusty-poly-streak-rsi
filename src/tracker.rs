@@ -2,7 +2,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval as tick_interval, Duration};
@@ -12,6 +14,23 @@ use crate::logger::TradeLogger;
 use crate::money::MoneyManager;
 use crate::polymarket::PolymarketClient;
 use crate::strategy::Prediction;
+
+type PolymarketFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+pub trait PolymarketReadClient: Send + Sync {
+    fn get_order_status<'a>(&'a self, order_id: &'a str) -> PolymarketFuture<'a, String>;
+    fn get_usdc_balance<'a>(&'a self) -> PolymarketFuture<'a, f64>;
+}
+
+impl PolymarketReadClient for PolymarketClient {
+    fn get_order_status<'a>(&'a self, order_id: &'a str) -> PolymarketFuture<'a, String> {
+        Box::pin(async move { PolymarketClient::get_order_status(self, order_id).await })
+    }
+
+    fn get_usdc_balance<'a>(&'a self) -> PolymarketFuture<'a, f64> {
+        Box::pin(async move { PolymarketClient::get_usdc_balance(self).await })
+    }
+}
 
 pub fn build_signal_key(strategy_name: &str, slug: &str, prediction: &Prediction) -> String {
     format!(
@@ -43,7 +62,7 @@ struct PendingTrade {
 /// Les ordres dry-run (id préfixé par "dry-run-") sont ignorés silencieusement.
 pub struct PositionTracker {
     pending: Mutex<Vec<PendingTrade>>,
-    client: Arc<PolymarketClient>,
+    client: Arc<dyn PolymarketReadClient>,
     logger: Arc<TradeLogger>,
     money: Arc<tokio::sync::Mutex<MoneyManager>>,
     state_path: PathBuf,
@@ -51,7 +70,13 @@ pub struct PositionTracker {
 }
 
 impl PositionTracker {
-    pub fn new(client: Arc<PolymarketClient>, logger: Arc<TradeLogger>, money: Arc<tokio::sync::Mutex<MoneyManager>>, logs_dir: &str, trade_amount_pct: f64) -> Self {
+    pub fn new(
+        client: Arc<dyn PolymarketReadClient>,
+        logger: Arc<TradeLogger>,
+        money: Arc<tokio::sync::Mutex<MoneyManager>>,
+        logs_dir: &str,
+        trade_amount_pct: f64,
+    ) -> Self {
         let state_path = PathBuf::from(logs_dir).join("pending_orders.json");
         let pending = Self::load_pending(&state_path);
         if !pending.is_empty() {
@@ -85,7 +110,10 @@ impl PositionTracker {
             return;
         }
         let mut pending = self.pending.lock().await;
-        if pending.iter().any(|t| t.signal_key == signal_key || t.order_id == order_id) {
+        if pending
+            .iter()
+            .any(|t| t.signal_key == signal_key || t.order_id == order_id)
+        {
             warn!(
                 "[TRACKER] Suivi déjà actif | trade_id={} order_id={} signal_key={}",
                 trade_id, order_id, signal_key
@@ -122,7 +150,11 @@ impl PositionTracker {
         self.pending.lock().await.len()
     }
 
-    pub async fn validate_with_closed_candle(&self, candle_close_time: DateTime<Utc>, candle_is_green: bool) {
+    pub async fn validate_with_closed_candle(
+        &self,
+        candle_close_time: DateTime<Utc>,
+        candle_is_green: bool,
+    ) {
         let mut pending = self.pending.lock().await;
         let mut changed = false;
         let len_before = pending.len();
@@ -160,16 +192,21 @@ impl PositionTracker {
                         let pct = self.trade_amount_pct;
                         tokio::spawn(async move {
                             for delay_ms in [300u64, 700, 1500] {
-                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
                                 match client.get_usdc_balance().await {
                                     Ok(balance) if balance > 0.0 => {
-                                        let amount = (balance * pct / 100.0 * 100.0).floor() / 100.0;
+                                        let amount =
+                                            (balance * pct / 100.0 * 100.0).floor() / 100.0;
                                         let amount = amount.max(1.0);
                                         info!("[MONEY] Balance post-trade: {:.2}$ → prochain montant = {:.2}$", balance, amount);
                                         money.lock().await.set_base_amount(amount);
                                         return;
                                     }
-                                    Ok(_) => warn!("[MONEY] Balance USDC encore 0 après {}ms, retry…", delay_ms),
+                                    Ok(_) => warn!(
+                                        "[MONEY] Balance USDC encore 0 après {}ms, retry…",
+                                        delay_ms
+                                    ),
                                     Err(e) => {
                                         warn!("[MONEY] Balance refresh post-trade échoué: {}", e);
                                         return;
@@ -209,8 +246,8 @@ impl PositionTracker {
         }
     }
 
-    async fn poll_once(&self) -> anyhow::Result<()> {
-        // Cloner la liste et relâcher le lock AVANT les appels réseau
+    pub async fn poll_once(&self) -> anyhow::Result<()> {
+        // Cloner la liste et relacher le lock AVANT les appels reseau
         let trades: Vec<PendingTrade> = self.pending.lock().await.clone();
         let mut still_pending = Vec::new();
 
@@ -229,13 +266,10 @@ impl PositionTracker {
                             trade.trade_id, trade.order_id, status
                         );
                     }
-                    let is_terminal = matches!(
-                        status.as_str(),
-                        "MATCHED" | "FILLED" | "CANCELLED" | "EXPIRED" | "UNMATCHED"
-                    );
-                    if is_terminal {
+                    if Self::is_terminal_status(&status) {
                         if status_changed {
-                            if let Err(e) = self.logger.update_order_status(&trade.trade_id, &status)
+                            if let Err(e) =
+                                self.logger.update_order_status(&trade.trade_id, &status)
                             {
                                 warn!("[TRACKER] update_order_status failed: {}", e);
                             } else {
@@ -244,7 +278,8 @@ impl PositionTracker {
                         }
 
                         if Self::is_non_fill_terminal_status(&status) {
-                            if let Err(e) = self.logger.update_outcome(&trade.trade_id, "NO_ENTRY") {
+                            if let Err(e) = self.logger.update_outcome(&trade.trade_id, "NO_ENTRY")
+                            {
                                 warn!("[TRACKER] update_outcome failed: {}", e);
                             } else {
                                 trade.validation_done = true;
@@ -254,7 +289,10 @@ impl PositionTracker {
                     still_pending.push(trade);
                 }
                 Err(e) => {
-                    warn!("[TRACKER] get_order_status({}) failed: {}", trade.order_id, e);
+                    warn!(
+                        "[TRACKER] get_order_status({}) failed: {}",
+                        trade.order_id, e
+                    );
                     still_pending.push(trade);
                 }
             }
@@ -304,14 +342,16 @@ impl PositionTracker {
         )
     }
 
+    fn is_terminal_status(status: &str) -> bool {
+        Self::is_filled_status(status) || Self::is_non_fill_terminal_status(status)
+    }
+
     fn can_drop_trade(trade: &PendingTrade) -> bool {
         trade.validation_done
             && trade
                 .order_status
                 .as_deref()
-                .map(|status| {
-                    Self::is_filled_status(status) || Self::is_non_fill_terminal_status(status)
-                })
+                .map(Self::is_terminal_status)
                 .unwrap_or(false)
     }
 
@@ -320,5 +360,22 @@ impl PositionTracker {
             (Prediction::Up, true) | (Prediction::Down, false) => "WIN".to_string(),
             _ => "LOSS".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PositionTracker;
+
+    #[test]
+    fn terminal_status_matching_is_case_insensitive() {
+        for status in ["MATCHED", "Matched", "filled", "Cancelled", "EXPIRED"] {
+            assert!(PositionTracker::is_terminal_status(status));
+        }
+    }
+
+    #[test]
+    fn open_status_is_not_terminal() {
+        assert!(!PositionTracker::is_terminal_status("OPEN"));
     }
 }

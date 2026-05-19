@@ -1,4 +1,6 @@
-use rusty_poly_streak_rsi::logger::{TradeLogger, TradeRecord};
+use chrono::{Duration, TimeZone, Utc};
+use rusty_poly_streak_rsi::logger::{PendingBuyTradeRecord, TradeLogger, TradeRecord};
+use rusty_poly_streak_rsi::trade_timing::TradeLatencies;
 use std::fs;
 
 fn make_record(trade_id: &str, prediction: &str) -> TradeRecord {
@@ -23,9 +25,43 @@ fn make_record(trade_id: &str, prediction: &str) -> TradeRecord {
 
 fn tmp_dir(label: &str) -> std::path::PathBuf {
     // Dossier unique par test pour éviter les conflits entre tests parallèles
-    let dir = std::env::temp_dir()
-        .join(format!("rusty_poly_streak_rsi_test_{}_{}", label, uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!(
+        "rusty_poly_streak_rsi_test_{}_{}",
+        label,
+        uuid::Uuid::new_v4()
+    ));
     dir
+}
+
+#[test]
+fn test_pending_buy_trade_record_factory_sets_csv_fields() {
+    let signal_close = Utc.with_ymd_and_hms(2026, 5, 19, 10, 0, 0).unwrap();
+    let target_open = signal_close + Duration::minutes(5);
+    let latencies = TradeLatencies {
+        signal_to_submit_start_ms: 1,
+        submit_start_to_ack_ms: 2,
+        signal_to_ack_ms: 3,
+        trade_open_to_order_ack_ms: 4,
+    };
+
+    let record = TradeRecord::pending_buy(PendingBuyTradeRecord {
+        trade_id: "trade-1",
+        signal_key: "strategy:slug:UP",
+        symbol: "btcusdt",
+        interval: "5m",
+        signal_close_time_utc: &signal_close,
+        target_candle_open_time_utc: &target_open,
+        prediction: "UP",
+        entry_order_type: "DRY_RUN",
+        order_status: "DRY_RUN",
+        latencies,
+    });
+
+    assert_eq!(record.trade_id, "trade-1");
+    assert_eq!(record.entry_side, "BUY");
+    assert_eq!(record.outcome, "PENDING");
+    assert_eq!(record.signal_to_ack_ms, 3);
+    assert_eq!(record.target_candle_open_time_utc, target_open.to_rfc3339());
 }
 
 // --- Création du CSV ---
@@ -34,7 +70,10 @@ fn tmp_dir(label: &str) -> std::path::PathBuf {
 fn test_logger_creates_csv_file() {
     let dir = tmp_dir("creates_csv");
     let _logger = TradeLogger::new(dir.to_str().unwrap()).unwrap();
-    assert!(dir.join("trades.csv").exists(), "Le fichier trades.csv doit être créé");
+    assert!(
+        dir.join("trades.csv").exists(),
+        "Le fichier trades.csv doit être créé"
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -45,8 +84,14 @@ fn test_logger_csv_contains_headers() {
     let content = fs::read_to_string(dir.join("trades.csv")).unwrap();
 
     for header in &[
-        "trade_id", "signal_key", "symbol", "interval", "prediction",
-        "order_status", "outcome", "signal_to_ack_ms",
+        "trade_id",
+        "signal_key",
+        "symbol",
+        "interval",
+        "prediction",
+        "order_status",
+        "outcome",
+        "signal_to_ack_ms",
     ] {
         assert!(content.contains(header), "Header manquant: {}", header);
     }
@@ -66,7 +111,10 @@ fn test_logger_writes_headers_on_empty_existing_file() {
 
     let _logger = TradeLogger::new(dir.to_str().unwrap()).unwrap();
     let content = fs::read_to_string(&csv_path).unwrap();
-    assert!(content.contains("trade_id"), "Les headers doivent être écrits sur un fichier vide");
+    assert!(
+        content.contains("trade_id"),
+        "Les headers doivent être écrits sur un fichier vide"
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -82,13 +130,22 @@ fn test_logger_does_not_overwrite_existing_data() {
 
     // Recréer le logger sur le même dossier
     let logger2 = TradeLogger::new(dir.to_str().unwrap()).unwrap();
-    logger2.log_trade(&make_record("id-second", "DOWN")).unwrap();
+    logger2
+        .log_trade(&make_record("id-second", "DOWN"))
+        .unwrap();
 
     let content_after = fs::read_to_string(dir.join("trades.csv")).unwrap();
     let line_count_after = content_after.lines().count();
 
-    assert_eq!(line_count_after, line_count_before + 1, "Une seule ligne doit être ajoutée");
-    assert!(!content_after.contains("trade_id\ntrade_id"), "Les headers ne doivent pas être dupliqués");
+    assert_eq!(
+        line_count_after,
+        line_count_before + 1,
+        "Une seule ligne doit être ajoutée"
+    );
+    assert!(
+        !content_after.contains("trade_id\ntrade_id"),
+        "Les headers ne doivent pas être dupliqués"
+    );
     fs::remove_dir_all(&dir).ok();
 }
 

@@ -94,10 +94,10 @@ impl ThreeCandleRsi7Reversal {
                     self.rsi = Some(rsi_from_avgs(ag, al));
                 }
             } else {
-                let ag = (self.avg_gain.unwrap() * (RSI_PERIOD - 1) as f64 + gain)
-                    / RSI_PERIOD as f64;
-                let al = (self.avg_loss.unwrap() * (RSI_PERIOD - 1) as f64 + loss)
-                    / RSI_PERIOD as f64;
+                let ag =
+                    (self.avg_gain.unwrap() * (RSI_PERIOD - 1) as f64 + gain) / RSI_PERIOD as f64;
+                let al =
+                    (self.avg_loss.unwrap() * (RSI_PERIOD - 1) as f64 + loss) / RSI_PERIOD as f64;
                 self.avg_gain = Some(ag);
                 self.avg_loss = Some(al);
                 self.rsi = Some(rsi_from_avgs(ag, al));
@@ -240,9 +240,9 @@ impl Strategy for ThreeCandleRsi7Reversal {
     fn candle_log_extras(&self) -> String {
         let rsi_s = self.rsi.map_or("N/A".into(), |r| format!("{:.2}", r));
         let series_s = match self.last_three_same_color() {
-            Some(true)  => "3xVERT",
+            Some(true) => "3xVERT",
             Some(false) => "3xROUGE",
-            None        => "mixte",
+            None => "mixte",
         };
         let atr_s = self.atr.map_or("N/A".into(), |a| format!("{:.2}", a));
         format!("RSI={} | série={} | ATR={}", rsi_s, series_s, atr_s)

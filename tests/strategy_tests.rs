@@ -64,8 +64,8 @@ fn test_color_three_red() {
 fn test_color_mixed_is_none() {
     let mut s = ThreeCandleRsi7Reversal::new(65.0, 35.0);
     s.on_closed_candle(&make_candle(100.0, 101.0)); // vert
-    s.on_closed_candle(&make_candle(101.0, 99.0));  // rouge
-    s.on_closed_candle(&make_candle(99.0, 100.0));  // vert
+    s.on_closed_candle(&make_candle(101.0, 99.0)); // rouge
+    s.on_closed_candle(&make_candle(99.0, 100.0)); // vert
     assert!(s.last_three_same_color().is_none());
 }
 
@@ -80,9 +80,15 @@ fn test_rsi_none_with_fewer_than_eight_candles() {
     for i in 0..7 {
         s.on_closed_candle(&make_candle(100.0 + i as f64, 101.0 + i as f64));
     }
-    assert!(s.compute_rsi().is_none(), "7 bougies = 6 deltas : RSI impossible");
+    assert!(
+        s.compute_rsi().is_none(),
+        "7 bougies = 6 deltas : RSI impossible"
+    );
     s.on_closed_candle(&make_candle(107.0, 108.0));
-    assert!(s.compute_rsi().is_some(), "8 bougies = 7 deltas : RSI calculable");
+    assert!(
+        s.compute_rsi().is_some(),
+        "8 bougies = 7 deltas : RSI calculable"
+    );
 }
 
 #[test]
@@ -91,7 +97,11 @@ fn test_rsi_all_gains_gives_100() {
     for i in 0..=7 {
         s.on_closed_candle(&make_candle(100.0 + i as f64, 101.0 + i as f64));
     }
-    assert_eq!(s.compute_rsi().unwrap(), 100.0, "Toutes les hausses → RSI = 100");
+    assert_eq!(
+        s.compute_rsi().unwrap(),
+        100.0,
+        "Toutes les hausses → RSI = 100"
+    );
 }
 
 /// Marché plat (tous doji) : avg_loss=0 → RSI=100, comportement identique Python.
@@ -114,20 +124,36 @@ fn test_rsi_all_losses_gives_zero() {
     for i in 0..=7 {
         s.on_closed_candle(&make_candle(108.0 - i as f64, 107.0 - i as f64));
     }
-    assert_eq!(s.compute_rsi().unwrap(), 0.0, "Toutes les baisses → RSI = 0");
+    assert_eq!(
+        s.compute_rsi().unwrap(),
+        0.0,
+        "Toutes les baisses → RSI = 0"
+    );
 }
 
 #[test]
 fn test_rsi_value_in_valid_range() {
     let mut s = ThreeCandleRsi7Reversal::new(65.0, 35.0);
     // Alternance : 4 hausses, 3 baisses
-    let candles = [(100., 102.), (102., 100.), (100., 102.), (102., 100.),
-                   (100., 102.), (102., 100.), (100., 102.), (102., 104.)];
+    let candles = [
+        (100., 102.),
+        (102., 100.),
+        (100., 102.),
+        (102., 100.),
+        (100., 102.),
+        (102., 100.),
+        (100., 102.),
+        (102., 104.),
+    ];
     for (o, c) in candles {
         s.on_closed_candle(&make_candle(o, c));
     }
     let rsi = s.compute_rsi().unwrap();
-    assert!(rsi >= 0.0 && rsi <= 100.0, "RSI doit être dans [0, 100], got {}", rsi);
+    assert!(
+        (0.0..=100.0).contains(&rsi),
+        "RSI doit être dans [0, 100], got {}",
+        rsi
+    );
 }
 
 // ============================================================
@@ -147,7 +173,13 @@ fn test_no_signal_before_rsi_warmup() {
 fn test_no_signal_without_three_same_color() {
     let mut s = ThreeCandleRsi7Reversal::new(65.0, 35.0);
     let candles: Vec<(f64, f64)> = (0..11)
-        .map(|i| if i % 2 == 0 { (100.0, 101.0) } else { (101.0, 100.0) })
+        .map(|i| {
+            if i % 2 == 0 {
+                (100.0, 101.0)
+            } else {
+                (101.0, 100.0)
+            }
+        })
         .collect();
     assert!(feed(&mut s, &candles).is_none());
 }
@@ -167,7 +199,10 @@ fn test_no_signal_rsi_neutral_with_green_series() {
     for &close in &[104.0f64, 106.0, 108.0] {
         result = s.on_closed_candle(&make_candle(close - 1.0, close));
     }
-    assert!(result.is_none(), "RSI≈42.86 : aucun signal attendu malgré 3 bougies vertes");
+    assert!(
+        result.is_none(),
+        "RSI≈42.86 : aucun signal attendu malgré 3 bougies vertes"
+    );
 }
 
 /// RSI Wilder ~57 (neutre) + 3 bougies vertes → pas de signal (RSI < 65)
@@ -177,12 +212,22 @@ fn test_no_signal_rsi_in_neutral_zone() {
     // Closes: 100,100,100,100,95,100,95,99,100,101,102
     // Wilder RSI après 11 bougies ≈ 57 (entre 35 et 65) → pas de signal
     let candles = [
-        (100.0, 100.0), (100.0, 100.0), (100.0, 100.0), // fill
-        (100.0, 100.0), (100.0, 95.0),  (95.0, 100.0),
-        (100.0,  95.0), (95.0,   99.0), (99.0,  100.0),
-        (100.0, 101.0), (101.0, 102.0),
+        (100.0, 100.0),
+        (100.0, 100.0),
+        (100.0, 100.0), // fill
+        (100.0, 100.0),
+        (100.0, 95.0),
+        (95.0, 100.0),
+        (100.0, 95.0),
+        (95.0, 99.0),
+        (99.0, 100.0),
+        (100.0, 101.0),
+        (101.0, 102.0),
     ];
-    assert!(feed(&mut s, &candles).is_none(), "RSI Wilder ~57 : aucun signal attendu");
+    assert!(
+        feed(&mut s, &candles).is_none(),
+        "RSI Wilder ~57 : aucun signal attendu"
+    );
 }
 
 #[test]
@@ -227,7 +272,7 @@ fn test_signal_rsi_in_valid_range() {
         .map(|i| (100.0 + i as f64 * 2.0, 102.0 + i as f64 * 2.0))
         .collect();
     let sig = feed(&mut s, &candles).unwrap();
-    assert!(sig.rsi >= 0.0 && sig.rsi <= 100.0);
+    assert!((0.0..=100.0).contains(&sig.rsi));
 }
 
 #[test]

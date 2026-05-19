@@ -150,7 +150,10 @@ pub async fn stream_candles(
                             info!("[RECONNECT] {} bougies manquées rattrapées", count);
                         }
                         Err(e) => {
-                            warn!("[RECONNECT] Impossible de rattraper les bougies manquées: {}", e);
+                            warn!(
+                                "[RECONNECT] Impossible de rattraper les bougies manquées: {}",
+                                e
+                            );
                         }
                         _ => {}
                     }
@@ -235,8 +238,7 @@ pub async fn stream_candles(
                                             continue;
                                         }
                                     };
-                                    let volume: f64 =
-                                        event.kline.volume.parse().unwrap_or(0.0);
+                                    let volume: f64 = event.kline.volume.parse().unwrap_or(0.0);
 
                                     let candle = Candle {
                                         open_time,
@@ -256,15 +258,11 @@ pub async fn stream_candles(
                                         continue;
                                     }
 
-                                    // P5 : try_send évite de bloquer le WebSocket si le channel est plein
-                                    match tx.try_send(candle) {
+                                    match tx.send(candle).await {
                                         Ok(_) => {
                                             last_close_time_ms = candle_close_ms;
                                         }
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            warn!("Channel saturé — bougie droppée (traitement trop lent)");
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        Err(_) => {
                                             return Ok(());
                                         }
                                     }
@@ -318,13 +316,9 @@ async fn catch_up_missed_candles(
         let ct_ms = candle.close_time.timestamp_millis();
         // Envoyer uniquement les bougies fermées qu'on n'a pas encore vues
         if ct_ms > last_close_time_ms && ct_ms < now_ms {
-            match tx.try_send(candle) {
+            match tx.send(candle).await {
                 Ok(_) => count += 1,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!("[RECONNECT] Channel saturé pendant le rattrapage");
-                    break;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                Err(_) => break,
             }
         }
     }

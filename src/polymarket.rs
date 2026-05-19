@@ -6,15 +6,12 @@ use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::{Client as SdkClobClient, Config as SdkConfig};
+use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::{
-    Amount,
-    AssetType,
-    OrderType as SdkOrderType,
-    Side as SdkSide,
+    Amount, AssetType, OrderType as SdkOrderType, Side as SdkSide,
     SignatureType as SdkSignatureType,
 };
-use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::{Client as SdkClobClient, Config as SdkConfig};
 use polymarket_client_sdk_v2::types::Decimal;
 use polymarket_client_sdk_v2::POLYGON;
 use serde::{Deserialize, Serialize};
@@ -31,7 +28,7 @@ use crate::strategy::{Prediction, Signal};
 // ── Constantes ───────────────────────────────────────────────────────────────
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
-const CLOB_API_BASE: &str = "https://clob.polymarket.com";
+const DEFAULT_CLOB_API_BASE: &str = "https://clob.polymarket.com";
 const CTF_EXCHANGE_ADDR: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 const POLYGON_CHAIN_ID: u64 = 137;
 const CLOB_AUTH_MSG: &str = "This message attests that I control the given wallet";
@@ -70,6 +67,14 @@ struct OrderBook {
     asks: Vec<OrderBookLevel>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LimitOrderQuote {
+    pub limit_price: f64,
+    pub expected_shares: f64,
+    pub effective_usdc: f64,
+    pub adjusted_to_min_size: bool,
+}
+
 #[derive(Deserialize)]
 struct GammaMarket {
     #[serde(alias = "conditionId")]
@@ -86,6 +91,85 @@ struct GammaMarket {
 
 fn default_order_min_size() -> f64 {
     5.0
+}
+
+pub fn parse_gamma_market_body(slug: &str, body: &str) -> Result<MarketInfo> {
+    let markets: Vec<GammaMarket> = serde_json::from_str(body).map_err(|e| {
+        anyhow!(
+            "Gamma API parse JSON: {} | body={}",
+            e,
+            &body[..body.len().min(300)]
+        )
+    })?;
+
+    let market = markets
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("Aucun marche trouve pour le slug '{}'", slug))?;
+
+    let outcomes: Vec<String> = serde_json::from_str(&market.outcomes)
+        .map_err(|e| anyhow!("Impossible de parser outcomes: {}", e))?;
+    let token_ids: Vec<String> = serde_json::from_str(&market.clob_token_ids)
+        .map_err(|e| anyhow!("Impossible de parser clobTokenIds: {}", e))?;
+
+    let up_idx = outcomes
+        .iter()
+        .position(|o| o.eq_ignore_ascii_case("up"))
+        .ok_or_else(|| anyhow!("Outcome 'Up' introuvable pour le slug '{}'", slug))?;
+    let down_idx = outcomes
+        .iter()
+        .position(|o| o.eq_ignore_ascii_case("down"))
+        .ok_or_else(|| anyhow!("Outcome 'Down' introuvable pour le slug '{}'", slug))?;
+
+    let up_token_id = token_ids
+        .get(up_idx)
+        .ok_or_else(|| anyhow!("Token UP manquant dans clobTokenIds pour '{}'", slug))?
+        .clone();
+    let down_token_id = token_ids
+        .get(down_idx)
+        .ok_or_else(|| anyhow!("Token DOWN manquant dans clobTokenIds pour '{}'", slug))?
+        .clone();
+
+    Ok(MarketInfo {
+        condition_id: market.condition_id,
+        up_token_id,
+        down_token_id,
+        slug: slug.to_string(),
+        order_min_size: market.order_min_size,
+    })
+}
+
+pub fn parse_best_ask_body(body: &str) -> Option<f64> {
+    let book: OrderBook = serde_json::from_str(body).ok()?;
+    book.asks.first()?.price.parse::<f64>().ok()
+}
+
+pub fn calculate_limit_order_quote(
+    amount_usdc: f64,
+    min_size: f64,
+    best_ask: Option<f64>,
+    limit_price_offset: f64,
+) -> LimitOrderQuote {
+    let base_price = best_ask.unwrap_or(0.50);
+    let limit_price = (base_price + limit_price_offset).min(0.99);
+    let expected_shares = amount_usdc / limit_price;
+
+    if expected_shares < min_size {
+        let effective_usdc = (min_size * limit_price * 100.0).ceil() / 100.0;
+        LimitOrderQuote {
+            limit_price,
+            expected_shares,
+            effective_usdc,
+            adjusted_to_min_size: true,
+        }
+    } else {
+        LimitOrderQuote {
+            limit_price,
+            expected_shares,
+            effective_usdc: amount_usdc,
+            adjusted_to_min_size: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +192,7 @@ struct ApiKeyResponse {
 
 pub struct PolymarketClient {
     config: Config,
+    clob_api_base: String,
     http: reqwest::Client,
     signer: Option<Arc<PrivateKeySigner>>,
     api_creds: Mutex<Option<ApiCreds>>,
@@ -137,7 +222,10 @@ impl PolymarketClient {
             match PrivateKeySigner::from_str(pk) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    warn!("POLYMARKET_PRIVATE_KEY invalide — mode réel désactivé: {}", e);
+                    warn!(
+                        "POLYMARKET_PRIVATE_KEY invalide — mode réel désactivé: {}",
+                        e
+                    );
                     None
                 }
             }
@@ -146,8 +234,16 @@ impl PolymarketClient {
         let signer = parsed_pk.as_ref().map(|s| Arc::new(s.clone()));
         let sdk_signer = parsed_pk.map(|s| s.with_chain_id(Some(POLYGON)));
 
+        let configured_clob_api_base = config.polymarket_api_url.trim().trim_end_matches('/');
+        let clob_api_base = if configured_clob_api_base.is_empty() {
+            DEFAULT_CLOB_API_BASE.to_string()
+        } else {
+            configured_clob_api_base.to_string()
+        };
+
         Self {
             config,
+            clob_api_base,
             http,
             signer,
             api_creds: Mutex::new(None),
@@ -157,10 +253,19 @@ impl PolymarketClient {
         }
     }
 
+    pub fn clob_api_base(&self) -> &str {
+        &self.clob_api_base
+    }
+
     /// Pré-chauffe la connexion TCP/TLS vers le CLOB (payer le handshake une seule fois).
     /// À appeler dans `main()` avant la boucle de trading.
     pub async fn warm_up(&self) {
-        match self.http.get(format!("{}/ok", CLOB_API_BASE)).send().await {
+        match self
+            .http
+            .get(format!("{}/ok", self.clob_api_base))
+            .send()
+            .await
+        {
             Ok(_) => info!("Connexion CLOB Polymarket pré-chauffée"),
             Err(e) => warn!("warm_up CLOB échoué (non bloquant): {}", e),
         }
@@ -204,11 +309,7 @@ impl PolymarketClient {
         let gamma_http_ms = t_resolve.elapsed().as_millis();
 
         if !resp.status().is_success() {
-            return Err(anyhow!(
-                "Gamma API {} → HTTP {}",
-                url,
-                resp.status()
-            ));
+            return Err(anyhow!("Gamma API {} → HTTP {}", url, resp.status()));
         }
 
         let body = resp
@@ -216,45 +317,7 @@ impl PolymarketClient {
             .await
             .map_err(|e| anyhow!("Gamma API lecture body: {}", e))?;
 
-        let markets: Vec<GammaMarket> = serde_json::from_str(&body)
-            .map_err(|e| anyhow!("Gamma API parse JSON: {} | body={}", e, &body[..body.len().min(300)]))?;
-
-        let market = markets
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("Aucun marché trouvé pour le slug '{}'", slug))?;
-
-        // outcomes et clobTokenIds sont des strings JSON encodées (ex: "[\"Up\",\"Down\"]")
-        let outcomes: Vec<String> = serde_json::from_str(&market.outcomes)
-            .map_err(|e| anyhow!("Impossible de parser outcomes: {}", e))?;
-        let token_ids: Vec<String> = serde_json::from_str(&market.clob_token_ids)
-            .map_err(|e| anyhow!("Impossible de parser clobTokenIds: {}", e))?;
-
-        let up_idx = outcomes
-            .iter()
-            .position(|o| o.eq_ignore_ascii_case("up"))
-            .ok_or_else(|| anyhow!("Outcome 'Up' introuvable pour le slug '{}'", slug))?;
-        let down_idx = outcomes
-            .iter()
-            .position(|o| o.eq_ignore_ascii_case("down"))
-            .ok_or_else(|| anyhow!("Outcome 'Down' introuvable pour le slug '{}'", slug))?;
-
-        let up_token_id = token_ids
-            .get(up_idx)
-            .ok_or_else(|| anyhow!("Token UP manquant dans clobTokenIds pour '{}'", slug))?
-            .clone();
-        let down_token_id = token_ids
-            .get(down_idx)
-            .ok_or_else(|| anyhow!("Token DOWN manquant dans clobTokenIds pour '{}'", slug))?
-            .clone();
-
-        let info = MarketInfo {
-            condition_id: market.condition_id,
-            up_token_id,
-            down_token_id,
-            slug: slug.to_string(),
-            order_min_size: market.order_min_size,
-        };
+        let info = parse_gamma_market_body(slug, &body)?;
 
         debug!(
             "Marché résolu: slug={} condition_id={} UP={} DOWN={} | timing: gamma_http={}ms total={}ms",
@@ -288,7 +351,11 @@ impl PolymarketClient {
         let mut ticker = tokio::time::interval(Duration::from_secs(20));
         loop {
             ticker.tick().await;
-            let _ = self.http.get(format!("{}/ok", CLOB_API_BASE)).send().await;
+            let _ = self
+                .http
+                .get(format!("{}/ok", self.clob_api_base))
+                .send()
+                .await;
         }
     }
 
@@ -297,7 +364,12 @@ impl PolymarketClient {
     /// - `DryRun` : simule sans appel réseau (aucune clé requise).
     /// - `Market` : ordre FAK signé EIP-712 + headers HMAC-SHA256 L2.
     /// - `Limit`  : non implémenté.
-    pub async fn place_order(&self, signal: &Signal, market: &MarketInfo, amount_usdc: f64) -> Result<OrderResult> {
+    pub async fn place_order(
+        &self,
+        signal: &Signal,
+        market: &MarketInfo,
+        amount_usdc: f64,
+    ) -> Result<OrderResult> {
         let token_id_str = match &signal.prediction {
             Prediction::Up => &market.up_token_id,
             Prediction::Down => &market.down_token_id,
@@ -325,8 +397,13 @@ impl PolymarketClient {
             }
 
             ExecutionMode::Limit => {
-                self.submit_limit_order(token_id_str, submitted_at, amount_usdc, market.order_min_size)
-                    .await
+                self.submit_limit_order(
+                    token_id_str,
+                    submitted_at,
+                    amount_usdc,
+                    market.order_min_size,
+                )
+                .await
             }
         }
     }
@@ -353,7 +430,7 @@ impl PolymarketClient {
 
         let resp = self
             .http
-            .get(format!("{}{}", CLOB_API_BASE, path))
+            .get(format!("{}{}", self.clob_api_base, path))
             .header("POLY_ADDRESS", &creds.address)
             .header("POLY_API_KEY", &creds.api_key)
             .header("POLY_PASSPHRASE", &creds.passphrase)
@@ -364,7 +441,11 @@ impl PolymarketClient {
             .map_err(|e| anyhow!("GET /data/order/{}: {}", order_id, e))?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!("GET /data/order/{} → HTTP {}", order_id, resp.status()));
+            return Err(anyhow!(
+                "GET /data/order/{} → HTTP {}",
+                order_id,
+                resp.status()
+            ));
         }
 
         let body: OrderStatusResp = resp
@@ -380,11 +461,13 @@ impl PolymarketClient {
     /// Retourne le meilleur ask (prix le plus bas côté vendeurs) depuis le CLOB public.
     /// Retourne None si le book est vide ou si l'appel échoue.
     async fn get_best_ask(&self, token_id_str: &str) -> Option<f64> {
-        let url = format!("{}/book?token_id={}", CLOB_API_BASE, token_id_str);
+        let url = format!("{}/book?token_id={}", self.clob_api_base, token_id_str);
         let resp = self.http.get(&url).send().await.ok()?;
-        if !resp.status().is_success() { return None; }
-        let book: OrderBook = resp.json().await.ok()?;
-        book.asks.first()?.price.parse::<f64>().ok()
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        parse_best_ask_body(&body)
     }
 
     /// Ordre limite GTC au prix `best_ask + LIMIT_PRICE_OFFSET`.
@@ -406,10 +489,16 @@ impl PolymarketClient {
         let t_book = Instant::now();
         let best_ask = self.get_best_ask(token_id_str).await;
         let book_ms = t_book.elapsed().as_millis();
+        let quote = calculate_limit_order_quote(
+            amount_usdc,
+            min_size,
+            best_ask,
+            self.config.limit_price_offset,
+        );
 
         let limit_price = match best_ask {
             Some(ask) => {
-                let p = (ask + self.config.limit_price_offset).min(0.99);
+                let p = quote.limit_price;
                 info!(
                     "[LIMIT] best_ask={:.4} offset={:.4} → limit_price={:.4} (book={}ms)",
                     ask, self.config.limit_price_offset, p, book_ms
@@ -417,7 +506,7 @@ impl PolymarketClient {
                 p
             }
             None => {
-                let fallback = (0.50_f64 + self.config.limit_price_offset).min(0.99);
+                let fallback = quote.limit_price;
                 warn!(
                     "[LIMIT] Order book vide ou inaccessible — fallback price={:.4}",
                     fallback
@@ -428,9 +517,9 @@ impl PolymarketClient {
 
         // Vérifier que le montant couvre le minimum de shares (par défaut 5 sur Polymarket).
         // shares = USDC / prix → si insuffisant, on monte au minimum requis.
-        let expected_shares = amount_usdc / limit_price;
-        let effective_usdc = if expected_shares < min_size {
-            let min_usdc = (min_size * limit_price * 100.0).ceil() / 100.0;
+        let expected_shares = quote.expected_shares;
+        let effective_usdc = if quote.adjusted_to_min_size {
+            let min_usdc = quote.effective_usdc;
             warn!(
                 "[LIMIT] {:.2} USDC → {:.2} shares < minimum {:.0} shares. Ajustement à {:.2} USDC",
                 amount_usdc, expected_shares, min_size, min_usdc
@@ -504,7 +593,7 @@ impl PolymarketClient {
         if let Some(creds) = guard.as_ref() {
             return Ok(creds.clone());
         }
-        let creds = Self::derive_api_creds(&self.http, signer).await?;
+        let creds = Self::derive_api_creds(&self.http, &self.clob_api_base, signer).await?;
         *guard = Some(creds.clone());
         Ok(creds)
     }
@@ -512,6 +601,7 @@ impl PolymarketClient {
     /// Auth L1 : signe le message ClobAuth (EIP-712) et appelle POST /auth/api-key.
     async fn derive_api_creds(
         http: &reqwest::Client,
+        clob_api_base: &str,
         signer: &PrivateKeySigner,
     ) -> Result<ApiCreds> {
         let timestamp = Utc::now().timestamp().to_string();
@@ -527,7 +617,7 @@ impl PolymarketClient {
 
         // Essaye POST (créer), si 4xx essaye GET (récupérer une clé existante)
         let resp = http
-            .post(format!("{}/auth/api-key", CLOB_API_BASE))
+            .post(format!("{}/auth/api-key", clob_api_base))
             .header("POLY_ADDRESS", &address_str)
             .header("POLY_SIGNATURE", &sig_hex)
             .header("POLY_TIMESTAMP", &timestamp)
@@ -537,11 +627,13 @@ impl PolymarketClient {
             .map_err(|e| anyhow!("POST /auth/api-key: {}", e))?;
 
         let key_resp: ApiKeyResponse = if resp.status().is_success() {
-            resp.json().await.map_err(|e| anyhow!("parse api-key response: {}", e))?
+            resp.json()
+                .await
+                .map_err(|e| anyhow!("parse api-key response: {}", e))?
         } else {
             // Clé déjà existante — la récupérer avec GET
             let resp2 = http
-                .get(format!("{}/auth/derive-api-key", CLOB_API_BASE))
+                .get(format!("{}/auth/derive-api-key", clob_api_base))
                 .header("POLY_ADDRESS", &address_str)
                 .header("POLY_SIGNATURE", &sig_hex)
                 .header("POLY_TIMESTAMP", &timestamp)
@@ -556,7 +648,10 @@ impl PolymarketClient {
                     resp2.status()
                 ));
             }
-            resp2.json().await.map_err(|e| anyhow!("parse derive-api-key response: {}", e))?
+            resp2
+                .json()
+                .await
+                .map_err(|e| anyhow!("parse derive-api-key response: {}", e))?
         };
 
         info!("Credentials Polymarket CLOB dérivés pour {}", address_str);
@@ -589,7 +684,7 @@ impl PolymarketClient {
         addr_pad[12..].copy_from_slice(contract.as_slice());
         buf[128..160].copy_from_slice(&addr_pad);
 
-        Ok(*keccak256(&buf))
+        Ok(*keccak256(buf))
     }
 
     /// Domain separator de ClobAuthDomain (pas de verifyingContract).
@@ -605,10 +700,14 @@ impl PolymarketClient {
         buf[64..96].copy_from_slice(version_hash.as_slice());
         buf[96..128].copy_from_slice(&U256::from(POLYGON_CHAIN_ID).to_be_bytes::<32>());
 
-        *keccak256(&buf)
+        *keccak256(buf)
     }
 
     /// Hash EIP-712 complet d'un ordre CTFExchange à signer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "EIP-712 Order hash mirrors the external contract field list"
+    )]
     pub fn order_signing_hash(
         salt: U256,
         maker: Address,
@@ -634,7 +733,7 @@ impl PolymarketClient {
         buf[32..64].copy_from_slice(&salt.to_be_bytes::<32>());
         buf[64..96].copy_from_slice(&maker_pad); // maker
         buf[96..128].copy_from_slice(&maker_pad); // signer = maker (EOA)
-        // taker = Address::ZERO (buf[128..160] déjà à zéro)
+                                                  // taker = Address::ZERO (buf[128..160] déjà à zéro)
         buf[160..192].copy_from_slice(&token_id.to_be_bytes::<32>());
         buf[192..224].copy_from_slice(&maker_amount.to_be_bytes::<32>());
         buf[224..256].copy_from_slice(&taker_amount.to_be_bytes::<32>());
@@ -644,7 +743,7 @@ impl PolymarketClient {
         buf[383] = side; // side uint8 dans le slot [352..384], octet LSB
         buf[415] = signature_type; // signatureType uint8 dans le slot [384..416], octet LSB
 
-        let struct_hash = keccak256(&buf);
+        let struct_hash = keccak256(buf);
         let domain_sep = Self::ctf_domain_separator()?;
 
         // "\x19\x01" || domainSeparator || structHash
@@ -654,14 +753,13 @@ impl PolymarketClient {
         final_buf[2..34].copy_from_slice(&domain_sep);
         final_buf[34..66].copy_from_slice(struct_hash.as_slice());
 
-        Ok(keccak256(&final_buf))
+        Ok(keccak256(final_buf))
     }
 
     /// Hash EIP-712 du message ClobAuth à signer pour l'auth L1.
     pub fn clob_auth_signing_hash(address: Address, timestamp: &str, nonce: u64) -> Result<B256> {
-        let typehash = keccak256(
-            b"ClobAuth(address address,string timestamp,uint256 nonce,string message)",
-        );
+        let typehash =
+            keccak256(b"ClobAuth(address address,string timestamp,uint256 nonce,string message)");
 
         let mut addr_pad = [0u8; 32];
         addr_pad[12..].copy_from_slice(address.as_slice());
@@ -676,7 +774,7 @@ impl PolymarketClient {
         buf[96..128].copy_from_slice(&U256::from(nonce).to_be_bytes::<32>());
         buf[128..160].copy_from_slice(msg_hash.as_slice());
 
-        let struct_hash = keccak256(&buf);
+        let struct_hash = keccak256(buf);
         let domain_sep = Self::clob_auth_domain_separator();
 
         let mut final_buf = [0u8; 66];
@@ -685,7 +783,7 @@ impl PolymarketClient {
         final_buf[2..34].copy_from_slice(&domain_sep);
         final_buf[34..66].copy_from_slice(struct_hash.as_slice());
 
-        Ok(keccak256(&final_buf))
+        Ok(keccak256(final_buf))
     }
 
     /// Sérialise une signature alloy en "0x<r><s><v>" (65 octets, v = 27 ou 28).
@@ -697,7 +795,13 @@ impl PolymarketClient {
         bytes[..32].copy_from_slice(&r.to_be_bytes::<32>());
         bytes[32..64].copy_from_slice(&s.to_be_bytes::<32>());
         bytes[64] = v;
-        format!("0x{}", bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+        format!(
+            "0x{}",
+            bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        )
     }
 
     /// Calcule la signature HMAC-SHA256 pour les headers L2.
@@ -738,7 +842,7 @@ impl PolymarketClient {
             .as_ref()
             .ok_or_else(|| anyhow!("POLYMARKET_PRIVATE_KEY requis pour le mode Market"))?;
 
-        let auth_builder = SdkClobClient::new(CLOB_API_BASE, SdkConfig::default())
+        let auth_builder = SdkClobClient::new(&self.clob_api_base, SdkConfig::default())
             .map_err(|e| anyhow!("SDK client init: {}", e))?
             .authentication_builder(sdk_signer);
 
@@ -798,8 +902,8 @@ impl PolymarketClient {
 
         // Prix plafond 0.99 : le CLOB matche au meilleur ask disponible.
         // Évite le fetch de l'order book (~200-250ms) à chaque ordre.
-        let max_price = Decimal::from_str("0.99")
-            .map_err(|e| anyhow!("prix max Decimal invalide: {}", e))?;
+        let max_price =
+            Decimal::from_str("0.99").map_err(|e| anyhow!("prix max Decimal invalide: {}", e))?;
 
         let token_id_u256 = U256::from_str_radix(token_id_str, 10)
             .map_err(|e| anyhow!("token_id parse U256: {}", e))?;
@@ -855,9 +959,14 @@ impl PolymarketClient {
         let mut attempt = 0usize;
 
         loop {
-            match self.submit_market_order(token_id_str, submitted_at, amount_usdc).await {
+            match self
+                .submit_market_order(token_id_str, submitted_at, amount_usdc)
+                .await
+            {
                 Ok(result) => return Ok(result),
-                Err(e) if Self::is_fok_unfilled_error(&e) && attempt < FOK_RETRY_DELAYS_SECS.len() => {
+                Err(e)
+                    if Self::is_fok_unfilled_error(&e) && attempt < FOK_RETRY_DELAYS_SECS.len() =>
+                {
                     let delay_secs = FOK_RETRY_DELAYS_SECS[attempt];
                     warn!(
                         "Ordre FOK non rempli immédiatement pour token={} — retry {}/{} dans {}s",

@@ -2,12 +2,16 @@ use chrono::{Duration, Utc};
 use rusty_poly_streak_rsi::binance::Candle;
 use rusty_poly_streak_rsi::config::{Config, ExecutionMode};
 use rusty_poly_streak_rsi::logger::{TradeLogger, TradeRecord};
+use rusty_poly_streak_rsi::money::MoneyManager;
 use rusty_poly_streak_rsi::polymarket::PolymarketClient;
 use rusty_poly_streak_rsi::strategy::Prediction;
-use rusty_poly_streak_rsi::money::MoneyManager;
-use rusty_poly_streak_rsi::tracker::{build_signal_key, PositionTracker};
+use rusty_poly_streak_rsi::tracker::{build_signal_key, PolymarketReadClient, PositionTracker};
+use std::collections::VecDeque;
 use std::fs;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 fn tmp_dir(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -37,6 +41,11 @@ fn make_config(logs_dir: &str) -> Config {
         polymarket_slug_prefix: "btc-updown-5m".to_string(),
         martingale_multiplier: 1.0,
         martingale_max_amount: 0.0,
+        trade_amount_pct: 0.0,
+        excluded_days: Vec::new(),
+        excluded_hours: Vec::new(),
+        ensemble_min_votes: 1,
+        limit_price_offset: 0.01,
     }
 }
 
@@ -54,7 +63,47 @@ fn make_candle(close_time: chrono::DateTime<Utc>, open: f64, close: f64) -> Cand
 }
 
 fn make_money(dir: &std::path::Path) -> Arc<tokio::sync::Mutex<MoneyManager>> {
-    Arc::new(tokio::sync::Mutex::new(MoneyManager::new(1.0, 1.0, 0.0, dir.to_str().unwrap())))
+    Arc::new(tokio::sync::Mutex::new(MoneyManager::new(
+        1.0,
+        1.0,
+        0.0,
+        dir.to_str().unwrap(),
+    )))
+}
+
+struct MockPolymarketClient {
+    statuses: Mutex<VecDeque<String>>,
+    balance: f64,
+}
+
+impl MockPolymarketClient {
+    fn new(statuses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            statuses: Mutex::new(statuses.into_iter().map(Into::into).collect()),
+            balance: 10.0,
+        }
+    }
+}
+
+impl PolymarketReadClient for MockPolymarketClient {
+    fn get_order_status<'a>(
+        &'a self,
+        _order_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.statuses
+                .lock()
+                .await
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no mocked status"))
+        })
+    }
+
+    fn get_usdc_balance<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<f64>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.balance) })
+    }
 }
 
 fn make_record(trade_id: &str, signal_key: &str, prediction: &str) -> TradeRecord {
@@ -91,7 +140,13 @@ async fn test_tracker_persists_pending_orders() {
     let client = Arc::new(PolymarketClient::new(make_config(dir.to_str().unwrap())));
 
     let money = make_money(&dir);
-    let tracker = PositionTracker::new(client.clone(), logger.clone(), money.clone(), dir.to_str().unwrap());
+    let tracker = PositionTracker::new(
+        client.clone(),
+        logger.clone(),
+        money.clone(),
+        dir.to_str().unwrap(),
+        0.0,
+    );
     tracker
         .track(
             "trade-1".to_string(),
@@ -103,7 +158,7 @@ async fn test_tracker_persists_pending_orders() {
         )
         .await;
 
-    let reloaded = PositionTracker::new(client, logger, money, dir.to_str().unwrap());
+    let reloaded = PositionTracker::new(client, logger, money, dir.to_str().unwrap(), 0.0);
     assert_eq!(reloaded.pending_count().await, 1);
     assert!(reloaded.is_signal_active("signal-1").await);
 
@@ -118,7 +173,7 @@ async fn test_tracker_ignores_duplicate_signal_key() {
     let client = Arc::new(PolymarketClient::new(make_config(dir.to_str().unwrap())));
 
     let money = make_money(&dir);
-    let tracker = PositionTracker::new(client, logger, money, dir.to_str().unwrap());
+    let tracker = PositionTracker::new(client, logger, money, dir.to_str().unwrap(), 0.0);
     tracker
         .track(
             "trade-1".to_string(),
@@ -152,7 +207,7 @@ async fn test_tracker_validates_win_with_green_candle_for_up() {
     let client = Arc::new(PolymarketClient::new(make_config(dir.to_str().unwrap())));
 
     let money = make_money(&dir);
-    let tracker = PositionTracker::new(client, logger.clone(), money, dir.to_str().unwrap());
+    let tracker = PositionTracker::new(client, logger.clone(), money, dir.to_str().unwrap(), 0.0);
     let target_close_time = Utc::now();
     logger
         .log_trade(&make_record("trade-1", "signal-1", "UP"))
@@ -176,5 +231,38 @@ async fn test_tracker_validates_win_with_green_candle_for_up() {
     let content = fs::read_to_string(dir.join("trades.csv")).unwrap();
     assert!(content.contains("WIN"));
     assert_eq!(tracker.pending_count().await, 0);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn test_tracker_poll_once_updates_terminal_order_status_with_mock_client() {
+    let dir = tmp_dir("poll_terminal");
+    fs::create_dir_all(&dir).unwrap();
+    let logger = Arc::new(TradeLogger::new(dir.to_str().unwrap()).unwrap());
+    let client = Arc::new(MockPolymarketClient::new(["matched"]));
+
+    let money = make_money(&dir);
+    let tracker = PositionTracker::new(client, logger.clone(), money, dir.to_str().unwrap(), 0.0);
+    let target_close_time = Utc::now();
+    logger
+        .log_trade(&make_record("trade-1", "signal-1", "UP"))
+        .unwrap();
+    tracker
+        .track(
+            "trade-1".to_string(),
+            "order-1".to_string(),
+            "signal-1".to_string(),
+            Prediction::Up,
+            target_close_time,
+            "OPEN".to_string(),
+        )
+        .await;
+
+    tracker.poll_once().await.unwrap();
+
+    let content = fs::read_to_string(dir.join("trades.csv")).unwrap();
+    assert!(content.contains("matched"));
+    assert_eq!(tracker.pending_count().await, 1);
+
     fs::remove_dir_all(&dir).ok();
 }

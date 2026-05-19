@@ -114,7 +114,10 @@ async fn main() -> Result<()> {
         }
         Err(e) => {
             eprintln!("\n[WARN] Ordre placé mais get_order_status échoué: {}", e);
-            eprintln!("       L'ordre a bien été envoyé (id={}), seul le polling a échoué.", order.order_id);
+            eprintln!(
+                "       L'ordre a bien été envoyé (id={}), seul le polling a échoué.",
+                order.order_id
+            );
         }
     }
 
