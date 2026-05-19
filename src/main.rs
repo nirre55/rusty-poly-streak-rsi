@@ -10,6 +10,7 @@ use rusty_poly_streak_rsi::interval::parse_interval_duration;
 use rusty_poly_streak_rsi::logger::TradeLogger;
 use rusty_poly_streak_rsi::money::MoneyManager;
 use rusty_poly_streak_rsi::polymarket::PolymarketClient;
+use rusty_poly_streak_rsi::runtime_metrics::RuntimeMetrics;
 use rusty_poly_streak_rsi::strategy_factory::create_strategy;
 use rusty_poly_streak_rsi::tracker::{PolymarketReadClient, PositionTracker};
 use rusty_poly_streak_rsi::trading_runtime::{
@@ -39,6 +40,7 @@ async fn main() -> Result<()> {
 
     let trade_logger = Arc::new(TradeLogger::new(&config.logs_dir)?);
     let poly_client = Arc::new(PolymarketClient::new(config.clone()));
+    let metrics = Arc::new(RuntimeMetrics::default());
     let trading_client: Arc<dyn PolymarketTradingClient> = poly_client.clone();
     let tracker_client: Arc<dyn PolymarketReadClient> = poly_client.clone();
 
@@ -114,6 +116,7 @@ async fn main() -> Result<()> {
         poly_client: trading_client,
         money_manager: money_manager.clone(),
         tracker: tracker.clone(),
+        metrics: metrics.clone(),
     };
 
     match binance::fetch_historical_candles(&config.symbol, &config.interval, 120).await {
@@ -158,6 +161,24 @@ async fn main() -> Result<()> {
                 &candle,
             )
             .await;
+            let snapshot = metrics.snapshot();
+            let total = snapshot.no_signal
+                + snapshot.filtered
+                + snapshot.duplicate_signal
+                + snapshot.market_resolve_failed
+                + snapshot.order_failed
+                + snapshot.order_placed;
+            if total > 0 && total % 50 == 0 {
+                info!(
+                    "[METRICS] no_signal={} filtered={} duplicate={} market_errors={} order_errors={} orders={}",
+                    snapshot.no_signal,
+                    snapshot.filtered,
+                    snapshot.duplicate_signal,
+                    snapshot.market_resolve_failed,
+                    snapshot.order_failed,
+                    snapshot.order_placed
+                );
+            }
         }
 
         warn!("[RECONNECT] Channel Binance ferme - relance du stream dans 5s...");

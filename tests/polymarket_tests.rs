@@ -5,6 +5,8 @@ use rusty_poly_streak_rsi::polymarket::{
     PolymarketClient,
 };
 use rusty_poly_streak_rsi::strategy::{Prediction, Signal};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn make_config(mode: ExecutionMode) -> Config {
     Config {
@@ -98,6 +100,18 @@ fn test_client_uses_configured_clob_api_url_without_trailing_slash() {
     config.polymarket_api_url = "https://example.test/".to_string();
     let client = PolymarketClient::new(config);
     assert_eq!(client.clob_api_base(), "https://example.test");
+}
+
+#[test]
+fn test_client_uses_configured_api_bases_without_trailing_slash() {
+    let config = make_config(ExecutionMode::DryRun);
+    let client = PolymarketClient::new_with_api_bases(
+        config,
+        "http://127.0.0.1:1234/",
+        "http://127.0.0.1:5678/",
+    );
+    assert_eq!(client.gamma_api_base(), "http://127.0.0.1:1234");
+    assert_eq!(client.clob_api_base(), "http://127.0.0.1:5678");
 }
 
 #[test]
@@ -231,4 +245,47 @@ async fn test_place_order_dryrun_timestamps_ordered() {
         order.ack_at >= order.submitted_at,
         "ack_at doit être >= submitted_at"
     );
+}
+
+#[tokio::test]
+async fn test_resolve_market_uses_configured_gamma_base_and_caches_result() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = r#"[{
+        "conditionId":"cond-live",
+        "outcomes":"[\"Up\",\"Down\"]",
+        "clobTokenIds":"[\"up-live\",\"down-live\"]",
+        "orderMinSize":5
+    }]"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 1024];
+        let read = socket.read(&mut buffer).await.unwrap();
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        assert!(request.contains("GET /markets?slug=btc-updown-5m-1710000000 "));
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let config = make_config(ExecutionMode::DryRun);
+    let client = PolymarketClient::new_with_api_bases(config, format!("http://{}", addr), "");
+
+    let first = client
+        .resolve_market("btc-updown-5m-1710000000")
+        .await
+        .unwrap();
+    let second = client
+        .resolve_market("btc-updown-5m-1710000000")
+        .await
+        .unwrap();
+
+    assert_eq!(first.condition_id, "cond-live");
+    assert_eq!(first.up_token_id, "up-live");
+    assert_eq!(second.down_token_id, "down-live");
+    server.await.unwrap();
 }

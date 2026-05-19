@@ -25,6 +25,10 @@ fn clear_config_env() {
         "INTERVAL",
         "POLYMARKET_API_KEY",
         "POLYMARKET_API_SECRET",
+        "POLYMARKET_API_URL",
+        "POLYMARKET_PRIVATE_KEY",
+        "POLYMARKET_FUNDER",
+        "POLYMARKET_SIGNATURE_TYPE",
         "STRATEGY_CONFIG",
     ] {
         std::env::remove_var(key);
@@ -241,5 +245,57 @@ fn test_config_debug_redacts_secrets() {
     std::env::remove_var("POLYMARKET_API_SECRET");
     std::env::remove_var("EXECUTION_MODE");
     std::env::remove_var("TRADE_AMOUNT_PCT");
+    clear_config_env();
+}
+
+#[test]
+fn test_config_market_mode_requires_private_key() {
+    let _guard = env_lock();
+    clear_config_env();
+    without_repo_dotenv(|| {
+        std::env::set_var("EXECUTION_MODE", "market");
+        std::env::set_var("TRADE_AMOUNT_USDC", "10");
+        let result = rusty_poly_streak_rsi::config::Config::from_env();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("POLYMARKET_PRIVATE_KEY"));
+    });
+    clear_config_env();
+}
+
+#[test]
+fn test_config_market_mode_rejects_invalid_clob_url() {
+    let _guard = env_lock();
+    clear_config_env();
+    without_repo_dotenv(|| {
+        std::env::set_var("EXECUTION_MODE", "market");
+        std::env::set_var("TRADE_AMOUNT_USDC", "10");
+        std::env::set_var("POLYMARKET_PRIVATE_KEY", "abc123");
+        std::env::set_var("POLYMARKET_API_URL", "clob.polymarket.com");
+        let result = rusty_poly_streak_rsi::config::Config::from_env();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("http://"));
+    });
+    clear_config_env();
+}
+
+#[test]
+fn test_config_proxy_signature_requires_funder() {
+    let _guard = env_lock();
+    clear_config_env();
+    without_repo_dotenv(|| {
+        std::env::set_var("EXECUTION_MODE", "limit");
+        std::env::set_var("TRADE_AMOUNT_USDC", "10");
+        std::env::set_var("POLYMARKET_PRIVATE_KEY", "abc123");
+        std::env::set_var("POLYMARKET_SIGNATURE_TYPE", "2");
+        let result = rusty_poly_streak_rsi::config::Config::from_env();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("POLYMARKET_FUNDER"));
+    });
     clear_config_env();
 }

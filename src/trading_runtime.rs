@@ -14,6 +14,7 @@ use crate::logger::{
 };
 use crate::money::MoneyManager;
 use crate::polymarket::{MarketInfo, OrderResult, PolymarketClient};
+use crate::runtime_metrics::RuntimeMetrics;
 use crate::strategy::{Prediction, Signal, Strategy};
 use crate::tracker::{build_signal_key, PositionTracker};
 use crate::trade_timing::TradeLatencies;
@@ -76,6 +77,12 @@ pub struct RuntimeState {
     pub poly_client: Arc<dyn PolymarketTradingClient>,
     pub money_manager: Arc<tokio::sync::Mutex<MoneyManager>>,
     pub tracker: Arc<PositionTracker>,
+    pub metrics: Arc<RuntimeMetrics>,
+}
+
+fn finish(state: &RuntimeState, action: ClosedCandleAction) -> ClosedCandleAction {
+    state.metrics.record(&action);
+    action
 }
 
 pub fn spawn_prefetch_next_market(
@@ -188,7 +195,7 @@ pub async fn process_closed_candle(
             &config.polymarket_slug_prefix,
         )
         .await;
-        return ClosedCandleAction::NoSignal;
+        return finish(state, ClosedCandleAction::NoSignal);
     };
 
     log_signal_detected(
@@ -220,14 +227,14 @@ pub async fn process_closed_candle(
             &config.polymarket_slug_prefix,
         )
         .await;
-        return ClosedCandleAction::Filtered;
+        return finish(state, ClosedCandleAction::Filtered);
     }
 
     let target_close_time = candle.close_time + interval_duration;
     let signal_key = build_signal_key(&signal.strategy_name, &slug, &signal.prediction);
 
     if should_skip_duplicate_signal(state, &signal_key, candle).await {
-        return ClosedCandleAction::DuplicateSignal;
+        return finish(state, ClosedCandleAction::DuplicateSignal);
     }
 
     let market = match state.poly_client.resolve_market(&slug).await {
@@ -238,7 +245,7 @@ pub async fn process_closed_candle(
                 .tracker
                 .validate_with_closed_candle(candle.close_time, candle.is_green())
                 .await;
-            return ClosedCandleAction::MarketResolveFailed;
+            return finish(state, ClosedCandleAction::MarketResolveFailed);
         }
     };
 
@@ -253,7 +260,7 @@ pub async fn process_closed_candle(
         Ok(r) => r,
         Err(e) => {
             error!("Erreur lors de l'envoi de l'ordre: {}", e);
-            return ClosedCandleAction::OrderFailed;
+            return finish(state, ClosedCandleAction::OrderFailed);
         }
     };
 
@@ -315,8 +322,11 @@ pub async fn process_closed_candle(
     )
     .await;
 
-    ClosedCandleAction::OrderPlaced {
-        trade_id,
-        signal_key,
-    }
+    finish(
+        state,
+        ClosedCandleAction::OrderPlaced {
+            trade_id,
+            signal_key,
+        },
+    )
 }

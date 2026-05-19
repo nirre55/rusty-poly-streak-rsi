@@ -5,6 +5,7 @@ use rusty_poly_streak_rsi::config::{Config, ExecutionMode};
 use rusty_poly_streak_rsi::logger::TradeLogger;
 use rusty_poly_streak_rsi::money::MoneyManager;
 use rusty_poly_streak_rsi::polymarket::{MarketInfo, OrderResult};
+use rusty_poly_streak_rsi::runtime_metrics::RuntimeMetrics;
 use rusty_poly_streak_rsi::strategy::{Prediction, Signal, Strategy};
 use rusty_poly_streak_rsi::tracker::{PolymarketReadClient, PositionTracker};
 use rusty_poly_streak_rsi::trading_runtime::{
@@ -187,6 +188,7 @@ async fn dry_run_closed_candle_flow_writes_trade_and_skips_tracker_pending() {
         poly_client: trading_client,
         money_manager: money,
         tracker: tracker.clone(),
+        metrics: Arc::new(RuntimeMetrics::default()),
     };
     let close_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
     let candle = make_candle(close_time);
@@ -202,6 +204,7 @@ async fn dry_run_closed_candle_flow_writes_trade_and_skips_tracker_pending() {
     .await;
 
     assert!(matches!(action, ClosedCandleAction::OrderPlaced { .. }));
+    assert_eq!(state.metrics.snapshot().order_placed, 1);
     assert_eq!(tracker.pending_count().await, 0);
 
     let csv = std::fs::read_to_string(dir.join("trades.csv")).unwrap();

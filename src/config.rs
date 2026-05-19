@@ -222,7 +222,7 @@ impl Config {
             })
             .collect();
 
-        Ok(Config {
+        let config = Config {
             binance_ws_url: env::var("BINANCE_WS_URL")
                 .unwrap_or_else(|_| "wss://stream.binance.com:9443/ws".to_string()),
             symbol: env::var("SYMBOL").unwrap_or_else(|_| "btcusdt".to_string()),
@@ -256,6 +256,46 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.01),
-        })
+        };
+        config.validate_for_startup()?;
+        Ok(config)
+    }
+
+    pub fn validate_for_startup(&self) -> Result<()> {
+        if matches!(self.execution_mode, ExecutionMode::DryRun) {
+            return Ok(());
+        }
+
+        let private_key = self
+            .evm_private_key
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if private_key.is_empty() {
+            anyhow::bail!(
+                "POLYMARKET_PRIVATE_KEY est requis pour EXECUTION_MODE={}",
+                self.execution_mode.as_str()
+            );
+        }
+
+        let clob_url = self.polymarket_api_url.trim();
+        if !(clob_url.starts_with("https://") || clob_url.starts_with("http://")) {
+            anyhow::bail!("POLYMARKET_API_URL doit commencer par http:// ou https:// en mode reel");
+        }
+
+        if matches!(self.polymarket_signature_type, Some(1 | 2))
+            && self
+                .polymarket_funder
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            anyhow::bail!(
+                "POLYMARKET_FUNDER est requis quand POLYMARKET_SIGNATURE_TYPE vaut 1 ou 2"
+            );
+        }
+
+        Ok(())
     }
 }

@@ -192,6 +192,7 @@ struct ApiKeyResponse {
 
 pub struct PolymarketClient {
     config: Config,
+    gamma_api_base: String,
     clob_api_base: String,
     http: reqwest::Client,
     signer: Option<Arc<PrivateKeySigner>>,
@@ -207,6 +208,14 @@ pub struct PolymarketClient {
 
 impl PolymarketClient {
     pub fn new(config: Config) -> Self {
+        Self::new_with_api_bases(config, GAMMA_API_BASE, "")
+    }
+
+    pub fn new_with_api_bases(
+        config: Config,
+        gamma_api_base: impl Into<String>,
+        clob_api_base_override: impl AsRef<str>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .tcp_keepalive(Some(Duration::from_secs(20)))
@@ -234,7 +243,13 @@ impl PolymarketClient {
         let signer = parsed_pk.as_ref().map(|s| Arc::new(s.clone()));
         let sdk_signer = parsed_pk.map(|s| s.with_chain_id(Some(POLYGON)));
 
-        let configured_clob_api_base = config.polymarket_api_url.trim().trim_end_matches('/');
+        let gamma_api_base = gamma_api_base.into().trim_end_matches('/').to_string();
+        let clob_override = clob_api_base_override.as_ref().trim().trim_end_matches('/');
+        let configured_clob_api_base = if clob_override.is_empty() {
+            config.polymarket_api_url.trim().trim_end_matches('/')
+        } else {
+            clob_override
+        };
         let clob_api_base = if configured_clob_api_base.is_empty() {
             DEFAULT_CLOB_API_BASE.to_string()
         } else {
@@ -243,6 +258,7 @@ impl PolymarketClient {
 
         Self {
             config,
+            gamma_api_base,
             clob_api_base,
             http,
             signer,
@@ -255,6 +271,10 @@ impl PolymarketClient {
 
     pub fn clob_api_base(&self) -> &str {
         &self.clob_api_base
+    }
+
+    pub fn gamma_api_base(&self) -> &str {
+        &self.gamma_api_base
     }
 
     /// Pré-chauffe la connexion TCP/TLS vers le CLOB (payer le handshake une seule fois).
@@ -299,7 +319,7 @@ impl PolymarketClient {
         }
 
         let t_resolve = Instant::now();
-        let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
+        let url = format!("{}/markets?slug={}", self.gamma_api_base, slug);
         let resp = self
             .http
             .get(&url)
