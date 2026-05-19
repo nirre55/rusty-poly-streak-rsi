@@ -59,6 +59,10 @@ pub struct Config {
     pub excluded_days: Vec<String>,
     /// Plages horaires UTC exclues du trading (ex: [(0, 9)]). Vide = aucun filtre.
     pub excluded_hours: Vec<(u32, u32)>,
+    /// Nombre minimum de votes pour la stratégie ensemble. Défaut: 1
+    pub ensemble_min_votes: u32,
+    /// Offset ajouté au meilleur ask pour les ordres limite (ex: 0.01). Défaut: 0.01
+    pub limit_price_offset: f64,
 }
 
 impl std::fmt::Debug for Config {
@@ -85,27 +89,31 @@ impl std::fmt::Debug for Config {
             .field("trade_amount_pct", &self.trade_amount_pct)
             .field("excluded_days", &self.excluded_days)
             .field("excluded_hours", &self.excluded_hours)
+            .field("ensemble_min_votes", &self.ensemble_min_votes)
+            .field("limit_price_offset", &self.limit_price_offset)
             .finish()
     }
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        // Config stratégie (priorité sur .env, mais pas sur les vars OS)
+        if let Ok(path) = std::env::var("STRATEGY_CONFIG") {
+            dotenvy::from_path(&path).ok();
+        }
+        // Secrets partagés (ne remplace pas ce qui est déjà défini)
         dotenvy::dotenv().ok();
 
-        let mode = env::var("EXECUTION_MODE").unwrap_or_else(|_| "dry-run".to_string());
-        // P10 : avertir si la valeur est inconnue au lieu de fallback silencieux
+        let mode = env::var("EXECUTION_MODE")
+            .map_err(|_| anyhow::anyhow!("EXECUTION_MODE requis dans le fichier de config stratégie (market | limit | dry-run)"))?;
         let execution_mode = match mode.as_str() {
             "market" => ExecutionMode::Market,
             "limit" => ExecutionMode::Limit,
             "dry-run" | "dryrun" => ExecutionMode::DryRun,
-            _ => {
-                warn!(
-                    "EXECUTION_MODE '{}' non reconnu — mode dry-run utilisé par défaut",
-                    mode
-                );
-                ExecutionMode::DryRun
-            }
+            _ => anyhow::bail!(
+                "EXECUTION_MODE '{}' non reconnu — valeurs acceptées: market, limit, dry-run",
+                mode
+            ),
         };
 
         let trade_amount_pct = env::var("TRADE_AMOUNT_PCT")
@@ -236,6 +244,14 @@ impl Config {
             trade_amount_pct,
             excluded_days,
             excluded_hours,
+            ensemble_min_votes: env::var("ENSEMBLE_MIN_VOTES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1),
+            limit_price_offset: env::var("LIMIT_PRICE_OFFSET")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.01),
         })
     }
 }

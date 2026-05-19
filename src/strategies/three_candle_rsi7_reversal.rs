@@ -236,4 +236,15 @@ impl Strategy for ThreeCandleRsi7Reversal {
     fn current_atr(&self) -> Option<f64> {
         self.atr
     }
+
+    fn candle_log_extras(&self) -> String {
+        let rsi_s = self.rsi.map_or("N/A".into(), |r| format!("{:.2}", r));
+        let series_s = match self.last_three_same_color() {
+            Some(true)  => "3xVERT",
+            Some(false) => "3xROUGE",
+            None        => "mixte",
+        };
+        let atr_s = self.atr.map_or("N/A".into(), |a| format!("{:.2}", a));
+        format!("RSI={} | série={} | ATR={}", rsi_s, series_s, atr_s)
+    }
 }

@@ -39,4 +39,7 @@ pub trait Strategy: Send + Sync {
     fn current_series(&self) -> Option<bool>;
     /// ATR14 courant (None si pas assez de bougies).
     fn current_atr(&self) -> Option<f64>;
+    /// Infos contextuelles à afficher dans le log de bougie fermée.
+    /// Chaque stratégie retourne sa propre représentation.
+    fn candle_log_extras(&self) -> String;
 }

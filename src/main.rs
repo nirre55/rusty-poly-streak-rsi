@@ -13,7 +13,9 @@ use rusty_poly_streak_rsi::logger::{
 use rusty_poly_streak_rsi::money::MoneyManager;
 use rusty_poly_streak_rsi::polymarket::PolymarketClient;
 use rusty_poly_streak_rsi::strategies::btc_5m_rules_90_min_votes_1::BtcRules90;
+use rusty_poly_streak_rsi::strategies::btc_15m_rules_18_min_votes_1::BtcRules18;
 use rusty_poly_streak_rsi::strategies::eth_5m_rules_25_min_votes_1::EthRules25;
+use rusty_poly_streak_rsi::strategies::eth_15m_rules_24_min_votes_1::EthRules24;
 use rusty_poly_streak_rsi::strategies::three_candle_rsi7_reversal::ThreeCandleRsi7Reversal;
 use rusty_poly_streak_rsi::strategy::{Prediction, Strategy};
 use rusty_poly_streak_rsi::tracker::{build_signal_key, PositionTracker};
@@ -38,14 +40,20 @@ fn create_strategy(config: &Config) -> Result<Box<dyn Strategy>> {
             config.rsi_overbought,
             config.rsi_oversold,
         ))),
-"btc_5m_rules_90_min_votes_1" => Ok(Box::new(BtcRules90::new(
+        "btc_5m_rules_90_min_votes_1" => Ok(Box::new(BtcRules90::new(
+            config.ensemble_min_votes,
+        ))),
+        "btc_15m_rules_18_min_votes_1" => Ok(Box::new(BtcRules18::new(
             config.ensemble_min_votes,
         ))),
         "eth_5m_rules_25_min_votes_1" => Ok(Box::new(EthRules25::new(
             config.ensemble_min_votes,
         ))),
+        "eth_15m_rules_24_min_votes_1" => Ok(Box::new(EthRules24::new(
+            config.ensemble_min_votes,
+        ))),
         other => anyhow::bail!(
-            "Stratégie '{}' inconnue. Stratégies disponibles: three_candle_rsi7_reversal, micro_ensemble_90_min_votes_1, btc_5m_rules_90_min_votes_1, eth_5m_rules_25_min_votes_1",
+            "Stratégie '{}' inconnue. Stratégies disponibles: three_candle_rsi7_reversal, btc_5m_rules_90_min_votes_1, btc_15m_rules_18_min_votes_1, eth_5m_rules_25_min_votes_1, eth_15m_rules_24_min_votes_1",
             other
         ),
     }

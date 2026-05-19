@@ -291,42 +291,24 @@ pub fn log_candle_close(
     candle_open: f64,
     close: f64,
     color: &str,
-    rsi: Option<f64>,
-    series: Option<bool>,
-    atr: Option<f64>,
+    extras: &str,
     close_time: &DateTime<Utc>,
 ) {
-    let rsi_str = match rsi {
-        Some(r) => format!("{:.2}", r),
-        None => "N/A".to_string(),
-    };
-    let series_str = match series {
-        Some(true) => "3xVERT",
-        Some(false) => "3xROUGE",
-        None => "mixte",
-    };
-    let atr_str = match atr {
-        Some(a) => format!("{:.2}", a),
-        None => "N/A".to_string(),
-    };
     let range = candle_high - candle_low;
-    let body_ratio_str = if range > 0.0 {
+    let body_str = if range > 0.0 {
         format!("{:.0}%", (close - candle_open).abs() / range * 100.0)
     } else {
         "N/A".to_string()
     };
-    let range_str = format!("{:.2}", range);
     info!(
-        "[BOUGIE FERMÉE] {} {} | close={:.2} {} | RSI={} | série={} | ATR={} | range={} | body={} | {}",
+        "[BOUGIE FERMÉE] {} {} | close={:.2} {} | {} | range={:.2} | body={} | {}",
         symbol,
         interval,
         close,
         color,
-        rsi_str,
-        series_str,
-        atr_str,
-        range_str,
-        body_ratio_str,
+        extras,
+        range,
+        body_str,
         close_time.format("%Y-%m-%d %H:%M:%S UTC")
     );
 }

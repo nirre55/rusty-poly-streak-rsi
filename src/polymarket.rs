@@ -61,6 +61,16 @@ pub struct OrderResult {
 // ── Types internes ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+struct OrderBookLevel {
+    price: String,
+}
+
+#[derive(Deserialize)]
+struct OrderBook {
+    asks: Vec<OrderBookLevel>,
+}
+
+#[derive(Deserialize)]
 struct GammaMarket {
     #[serde(alias = "conditionId")]
     condition_id: String,
@@ -314,9 +324,10 @@ impl PolymarketClient {
                     .await
             }
 
-            ExecutionMode::Limit => Err(anyhow!(
-                "Mode Limit non implémenté — devra imposer un minimum de 5 shares"
-            )),
+            ExecutionMode::Limit => {
+                self.submit_limit_order(token_id_str, submitted_at, amount_usdc, market.order_min_size)
+                    .await
+            }
         }
     }
 
@@ -362,6 +373,127 @@ impl PolymarketClient {
             .map_err(|e| anyhow!("parse order status: {}", e))?;
 
         Ok(body.status)
+    }
+
+    // ── Order book ────────────────────────────────────────────────────────────
+
+    /// Retourne le meilleur ask (prix le plus bas côté vendeurs) depuis le CLOB public.
+    /// Retourne None si le book est vide ou si l'appel échoue.
+    async fn get_best_ask(&self, token_id_str: &str) -> Option<f64> {
+        let url = format!("{}/book?token_id={}", CLOB_API_BASE, token_id_str);
+        let resp = self.http.get(&url).send().await.ok()?;
+        if !resp.status().is_success() { return None; }
+        let book: OrderBook = resp.json().await.ok()?;
+        book.asks.first()?.price.parse::<f64>().ok()
+    }
+
+    /// Ordre limite GTC au prix `best_ask + LIMIT_PRICE_OFFSET`.
+    /// Garantit le fill quasi-systématique en étant agressif sur le prix.
+    async fn submit_limit_order(
+        &self,
+        token_id_str: &str,
+        submitted_at: DateTime<Utc>,
+        amount_usdc: f64,
+        min_size: f64,
+    ) -> Result<OrderResult> {
+        use std::time::Instant;
+
+        let sdk_signer = self
+            .sdk_signer
+            .as_ref()
+            .ok_or_else(|| anyhow!("POLYMARKET_PRIVATE_KEY requis pour le mode Limit"))?;
+
+        let t_book = Instant::now();
+        let best_ask = self.get_best_ask(token_id_str).await;
+        let book_ms = t_book.elapsed().as_millis();
+
+        let limit_price = match best_ask {
+            Some(ask) => {
+                let p = (ask + self.config.limit_price_offset).min(0.99);
+                info!(
+                    "[LIMIT] best_ask={:.4} offset={:.4} → limit_price={:.4} (book={}ms)",
+                    ask, self.config.limit_price_offset, p, book_ms
+                );
+                p
+            }
+            None => {
+                let fallback = (0.50_f64 + self.config.limit_price_offset).min(0.99);
+                warn!(
+                    "[LIMIT] Order book vide ou inaccessible — fallback price={:.4}",
+                    fallback
+                );
+                fallback
+            }
+        };
+
+        // Vérifier que le montant couvre le minimum de shares (par défaut 5 sur Polymarket).
+        // shares = USDC / prix → si insuffisant, on monte au minimum requis.
+        let expected_shares = amount_usdc / limit_price;
+        let effective_usdc = if expected_shares < min_size {
+            let min_usdc = (min_size * limit_price * 100.0).ceil() / 100.0;
+            warn!(
+                "[LIMIT] {:.2} USDC → {:.2} shares < minimum {:.0} shares. Ajustement à {:.2} USDC",
+                amount_usdc, expected_shares, min_size, min_usdc
+            );
+            min_usdc
+        } else {
+            amount_usdc
+        };
+
+        let t0 = Instant::now();
+        let client = self.get_or_create_sdk_client().await?;
+        let sdk_client_ms = t0.elapsed().as_millis();
+
+        let truncated_usdc = (effective_usdc * 100.0).floor() / 100.0;
+        let amount = Decimal::from_str(&format!("{:.2}", truncated_usdc))
+            .map_err(|e| anyhow!("montant Decimal invalide: {}", e))?;
+
+        let price_decimal = Decimal::from_str(&format!("{:.4}", limit_price))
+            .map_err(|e| anyhow!("prix limite Decimal invalide: {}", e))?;
+
+        let token_id_u256 = U256::from_str_radix(token_id_str, 10)
+            .map_err(|e| anyhow!("token_id parse U256: {}", e))?;
+
+        let t1 = Instant::now();
+        let order = client
+            .market_order()
+            .token_id(token_id_u256)
+            .amount(Amount::usdc(amount).map_err(|e| anyhow!("Amount::usdc: {}", e))?)
+            .price(price_decimal)
+            .side(SdkSide::Buy)
+            .order_type(SdkOrderType::GTC)
+            .build()
+            .await
+            .map_err(|e| anyhow!("SDK build limit_order: {}", e))?;
+        let build_ms = t1.elapsed().as_millis();
+
+        let t2 = Instant::now();
+        let signed_order = client
+            .sign(sdk_signer, order)
+            .await
+            .map_err(|e| anyhow!("SDK sign order: {}", e))?;
+        let sign_ms = t2.elapsed().as_millis();
+
+        let t3 = Instant::now();
+        let resp = client
+            .post_order(signed_order)
+            .await
+            .map_err(|e| anyhow!("SDK post_order: {}", e))?;
+        let post_ms = t3.elapsed().as_millis();
+        let ack_at = Utc::now();
+
+        info!(
+            "Ordre GTC envoyé | token={} amount={:.2}USDC price={:.4} | book={}ms sdk={}ms build={}ms sign={}ms post={}ms",
+            token_id_str, effective_usdc, limit_price,
+            book_ms, sdk_client_ms, build_ms, sign_ms, post_ms
+        );
+
+        Ok(OrderResult {
+            order_id: format!("{:?}", resp.order_id).trim_matches('"').to_string(),
+            status: format!("{:?}", resp.status).trim_matches('"').to_string(),
+            submitted_at,
+            ack_at,
+        })
     }
 
     // ── Helpers privés ────────────────────────────────────────────────────────
