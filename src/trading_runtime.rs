@@ -260,6 +260,13 @@ pub async fn process_closed_candle(
         Ok(r) => r,
         Err(e) => {
             error!("Erreur lors de l'envoi de l'ordre: {}", e);
+            validate_and_prefetch_next_market(
+                state,
+                candle,
+                interval_duration,
+                &config.polymarket_slug_prefix,
+            )
+            .await;
             return finish(state, ClosedCandleAction::OrderFailed);
         }
     };
@@ -276,7 +283,7 @@ pub async fn process_closed_candle(
         Prediction::Down => &market.down_token_id,
     };
 
-    log_order_sent(&order_result.order_id, token_id, trade_amount);
+    log_order_sent(&order_result.order_id, token_id, order_result.amount_usdc);
     log_order_ack(
         &order_result.order_id,
         &order_result.status,

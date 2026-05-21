@@ -19,6 +19,21 @@ impl ExecutionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketOrderType {
+    Fok,
+    Fak,
+}
+
+impl MarketOrderType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MarketOrderType::Fok => "FOK",
+            MarketOrderType::Fak => "FAK",
+        }
+    }
+}
+
 // P13 : impl Debug manuel pour masquer les secrets dans les logs
 #[derive(Clone)]
 pub struct Config {
@@ -63,6 +78,7 @@ pub struct Config {
     pub ensemble_min_votes: u32,
     /// Offset ajouté au meilleur ask pour les ordres limite (ex: 0.01). Défaut: 0.01
     pub limit_price_offset: f64,
+    pub market_order_type: MarketOrderType,
 }
 
 impl std::fmt::Debug for Config {
@@ -91,6 +107,7 @@ impl std::fmt::Debug for Config {
             .field("excluded_hours", &self.excluded_hours)
             .field("ensemble_min_votes", &self.ensemble_min_votes)
             .field("limit_price_offset", &self.limit_price_offset)
+            .field("market_order_type", &self.market_order_type)
             .finish()
     }
 }
@@ -113,6 +130,20 @@ impl Config {
             _ => anyhow::bail!(
                 "EXECUTION_MODE '{}' non reconnu — valeurs acceptées: market, limit, dry-run",
                 mode
+            ),
+        };
+
+        let market_order_type = match env::var("MARKET_ORDER_TYPE")
+            .unwrap_or_else(|_| "fok".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "fok" => MarketOrderType::Fok,
+            "fak" => MarketOrderType::Fak,
+            other => anyhow::bail!(
+                "MARKET_ORDER_TYPE '{}' non reconnu - valeurs acceptees: fok, fak",
+                other
             ),
         };
 
@@ -256,6 +287,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.01),
+            market_order_type,
         };
         config.validate_for_startup()?;
         Ok(config)

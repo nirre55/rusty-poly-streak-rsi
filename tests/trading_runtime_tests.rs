@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rusty_poly_streak_rsi::binance::Candle;
-use rusty_poly_streak_rsi::config::{Config, ExecutionMode};
+use rusty_poly_streak_rsi::config::{Config, ExecutionMode, MarketOrderType};
 use rusty_poly_streak_rsi::logger::TradeLogger;
 use rusty_poly_streak_rsi::money::MoneyManager;
 use rusty_poly_streak_rsi::polymarket::{MarketInfo, OrderResult};
@@ -48,6 +48,7 @@ fn make_config(logs_dir: &str) -> Config {
         excluded_hours: Vec::new(),
         ensemble_min_votes: 1,
         limit_price_offset: 0.01,
+        market_order_type: MarketOrderType::Fok,
     }
 }
 
@@ -127,12 +128,17 @@ impl PolymarketTradingClient for MockRuntimePolymarketClient {
         &'a self,
         _signal: &'a Signal,
         _market: &'a MarketInfo,
-        _amount_usdc: f64,
+        amount_usdc: f64,
     ) -> Pin<Box<dyn Future<Output = Result<OrderResult>> + Send + 'a>> {
         Box::pin(async move {
             Ok(OrderResult {
                 order_id: "dry-run-test-order".to_string(),
                 status: "DRY_RUN".to_string(),
+                amount_usdc,
+                limit_price: None,
+                execution_price: None,
+                execution_price_source: None,
+                size_matched: None,
                 submitted_at: Utc::now(),
                 ack_at: Utc::now(),
             })

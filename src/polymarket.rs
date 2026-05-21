@@ -3,10 +3,11 @@ use alloy::signers::{local::PrivateKeySigner, Signer};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine};
 use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
 use polymarket_client_sdk_v2::clob::types::{
     Amount, AssetType, OrderType as SdkOrderType, Side as SdkSide,
     SignatureType as SdkSignatureType,
@@ -19,20 +20,24 @@ use serde_json;
 use sha2::Sha256;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::config::{Config, ExecutionMode};
+use crate::config::{Config, ExecutionMode, MarketOrderType};
 use crate::strategy::{Prediction, Signal};
 
 // ── Constantes ───────────────────────────────────────────────────────────────
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const DEFAULT_CLOB_API_BASE: &str = "https://clob.polymarket.com";
+const MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const CTF_EXCHANGE_ADDR: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 const POLYGON_CHAIN_ID: u64 = 137;
 const CLOB_AUTH_MSG: &str = "This message attests that I control the given wallet";
 const FOK_RETRY_DELAYS_SECS: [u64; 3] = [3, 7, 10];
+const CLOB_TEMPORARY_RETRY_DELAYS_SECS: [u64; 3] = [5, 15, 30];
+const MAX_RETRY_AFTER_SECS: u64 = 60;
 
 // ── Types publics (API inchangée) ─────────────────────────────────────────────
 
@@ -50,9 +55,49 @@ pub struct MarketInfo {
 pub struct OrderResult {
     pub order_id: String,
     pub status: String,
+    pub amount_usdc: f64,
+    pub limit_price: Option<f64>,
+    pub execution_price: Option<f64>,
+    pub execution_price_source: Option<String>,
+    pub size_matched: Option<f64>,
     #[allow(dead_code)]
     pub submitted_at: DateTime<Utc>,
     pub ack_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderExecutionDetails {
+    pub status: String,
+    pub order_price: Option<f64>,
+    pub average_price: Option<f64>,
+    pub size_matched: Option<f64>,
+}
+
+impl OrderExecutionDetails {
+    fn execution_price_with_source(&self) -> Option<(f64, &'static str)> {
+        self.average_price
+            .map(|price| (price, "average_price"))
+            .or_else(|| self.order_price.map(|price| (price, "order_price")))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenOrderSummary {
+    pub id: String,
+    pub status: String,
+    pub asset_id: String,
+    pub side: String,
+    pub original_size: String,
+    pub size_matched: String,
+    pub price: String,
+    pub outcome: String,
+    pub order_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelOrderSummary {
+    pub canceled: Vec<String>,
+    pub not_canceled: Vec<(String, String)>,
 }
 
 // ── Types internes ────────────────────────────────────────────────────────────
@@ -60,6 +105,8 @@ pub struct OrderResult {
 #[derive(Deserialize)]
 struct OrderBookLevel {
     price: String,
+    #[serde(default)]
+    size: String,
 }
 
 #[derive(Deserialize)]
@@ -141,7 +188,47 @@ pub fn parse_gamma_market_body(slug: &str, body: &str) -> Result<MarketInfo> {
 
 pub fn parse_best_ask_body(body: &str) -> Option<f64> {
     let book: OrderBook = serde_json::from_str(body).ok()?;
-    book.asks.first()?.price.parse::<f64>().ok()
+    book.asks
+        .iter()
+        .filter_map(|level| level.price.parse::<f64>().ok())
+        .min_by(f64::total_cmp)
+}
+
+pub fn parse_market_ws_best_ask_message(token_id: &str, body: &str) -> Option<f64> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let event_type = value.get("event_type")?.as_str()?;
+
+    match event_type {
+        "best_bid_ask" => {
+            let asset_id = value.get("asset_id")?.as_str()?;
+            if asset_id == token_id {
+                value.get("best_ask")?.as_str()?.parse::<f64>().ok()
+            } else {
+                None
+            }
+        }
+        "book" => {
+            let asset_id = value.get("asset_id")?.as_str()?;
+            if asset_id == token_id {
+                value
+                    .get("asks")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|level| level.get("price")?.as_str()?.parse::<f64>().ok())
+                    .min_by(f64::total_cmp)
+            } else {
+                None
+            }
+        }
+        "price_change" => value
+            .get("price_changes")?
+            .as_array()?
+            .iter()
+            .filter(|change| change.get("asset_id").and_then(|id| id.as_str()) == Some(token_id))
+            .filter_map(|change| change.get("best_ask")?.as_str()?.parse::<f64>().ok())
+            .min_by(f64::total_cmp),
+        _ => None,
+    }
 }
 
 pub fn calculate_limit_order_quote(
@@ -170,6 +257,95 @@ pub fn calculate_limit_order_quote(
             adjusted_to_min_size: false,
         }
     }
+}
+
+pub fn calculate_available_shares_up_to_price(body: &str, limit_price: f64) -> Option<f64> {
+    let book: OrderBook = serde_json::from_str(body).ok()?;
+    Some(
+        book.asks
+            .iter()
+            .filter_map(|level| {
+                let price = level.price.parse::<f64>().ok()?;
+                let size = level.size.parse::<f64>().ok()?;
+                (price <= limit_price).then_some(size)
+            })
+            .sum(),
+    )
+}
+
+pub fn validate_sufficient_usdc_balance(required_usdc: f64, available_usdc: f64) -> Result<()> {
+    if available_usdc + 0.000_001 < required_usdc {
+        return Err(anyhow!(
+            "solde USDC insuffisant pour l'ordre: requis={:.2} disponible={:.2}",
+            required_usdc,
+            available_usdc
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn parse_order_status_body(body: &str) -> Result<String> {
+    Ok(parse_order_execution_details_body(body)?.status)
+}
+
+pub fn parse_order_execution_details_body(body: &str) -> Result<OrderExecutionDetails> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        anyhow!(
+            "parse order status JSON: {} | body={}",
+            e,
+            &body[..body.len().min(300)]
+        )
+    })?;
+
+    let order = order_details_value(&value);
+    let status = order
+        .and_then(|order| order.get("status"))
+        .and_then(|status| status.as_str())
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "order status absent dans la reponse Polymarket | body={}",
+                &body[..body.len().min(300)]
+            )
+        })?;
+
+    Ok(OrderExecutionDetails {
+        status: status.to_string(),
+        order_price: order.and_then(|order| numeric_field(order, &["price"])),
+        average_price: order.and_then(|order| {
+            numeric_field(
+                order,
+                &["average_price", "avg_price", "averagePrice", "avgPrice"],
+            )
+        }),
+        size_matched: order.and_then(|order| {
+            numeric_field(
+                order,
+                &["size_matched", "matched_size", "sizeMatched", "matchedSize"],
+            )
+        }),
+    })
+}
+
+fn order_details_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value
+        .get("order")
+        .or_else(|| value.as_array().and_then(|orders| orders.first()))
+        .or(Some(value))
+}
+
+fn numeric_field(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(json_number)
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +582,11 @@ impl PolymarketClient {
                 Ok(OrderResult {
                     order_id: format!("dry-run-{}", Uuid::new_v4()),
                     status: "DRY_RUN".to_string(),
+                    amount_usdc,
+                    limit_price: None,
+                    execution_price: None,
+                    execution_price_source: None,
+                    size_matched: None,
                     submitted_at,
                     ack_at: Utc::now(),
                 })
@@ -417,7 +598,7 @@ impl PolymarketClient {
             }
 
             ExecutionMode::Limit => {
-                self.submit_limit_order(
+                self.submit_limit_order_with_retry(
                     token_id_str,
                     submitted_at,
                     amount_usdc,
@@ -431,6 +612,13 @@ impl PolymarketClient {
     /// Récupère le statut courant d'un ordre via `GET /orders/{order_id}`.
     /// Requiert le signer (mode Market uniquement — les ordres dry-run ne sont pas tracés).
     pub async fn get_order_status(&self, order_id: &str) -> Result<String> {
+        Ok(self.get_order_execution_details(order_id).await?.status)
+    }
+
+    pub async fn get_order_execution_details(
+        &self,
+        order_id: &str,
+    ) -> Result<OrderExecutionDetails> {
         let signer = self
             .signer
             .as_ref()
@@ -441,12 +629,6 @@ impl PolymarketClient {
         let timestamp = Utc::now().timestamp().to_string();
         let path = format!("/data/order/{}", order_id);
         let sig = Self::compute_hmac_sig(&creds.secret, &timestamp, "GET", &path, "")?;
-
-        #[derive(Deserialize)]
-        struct OrderStatusResp {
-            #[serde(default)]
-            status: String,
-        }
 
         let resp = self
             .http
@@ -468,12 +650,12 @@ impl PolymarketClient {
             ));
         }
 
-        let body: OrderStatusResp = resp
-            .json()
+        let body = resp
+            .text()
             .await
-            .map_err(|e| anyhow!("parse order status: {}", e))?;
+            .map_err(|e| anyhow!("lecture order status body: {}", e))?;
 
-        Ok(body.status)
+        parse_order_execution_details_body(&body)
     }
 
     // ── Order book ────────────────────────────────────────────────────────────
@@ -482,12 +664,80 @@ impl PolymarketClient {
     /// Retourne None si le book est vide ou si l'appel échoue.
     async fn get_best_ask(&self, token_id_str: &str) -> Option<f64> {
         let url = format!("{}/book?token_id={}", self.clob_api_base, token_id_str);
-        let resp = self.http.get(&url).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
+        if let Ok(resp) = self.http.get(&url).send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.text().await {
+                    if let Some(best_ask) = parse_best_ask_body(&body) {
+                        return Some(best_ask);
+                    }
+                }
+            }
         }
-        let body = resp.text().await.ok()?;
-        parse_best_ask_body(&body)
+
+        warn!(
+            "[LIMIT] /book indisponible ou vide pour token={} - tentative WebSocket snapshot",
+            token_id_str
+        );
+        self.get_best_ask_ws_snapshot(token_id_str, Duration::from_millis(1500))
+            .await
+    }
+
+    pub async fn get_best_ask_ws_snapshot(
+        &self,
+        token_id_str: &str,
+        timeout_duration: Duration,
+    ) -> Option<f64> {
+        let subscription = serde_json::json!({
+            "assets_ids": [token_id_str],
+            "type": "market",
+            "custom_feature_enabled": true
+        })
+        .to_string();
+
+        let fut = async {
+            let (mut ws, _) = connect_async(MARKET_WS_URL).await.ok()?;
+            ws.send(Message::Text(subscription)).await.ok()?;
+            while let Some(message) = ws.next().await {
+                match message.ok()? {
+                    Message::Text(text) => {
+                        if let Some(best_ask) =
+                            parse_market_ws_best_ask_message(token_id_str, &text)
+                        {
+                            return Some(best_ask);
+                        }
+                    }
+                    Message::Binary(bytes) => {
+                        let text = String::from_utf8(bytes).ok()?;
+                        if let Some(best_ask) =
+                            parse_market_ws_best_ask_message(token_id_str, &text)
+                        {
+                            return Some(best_ask);
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload)).await.ok()?;
+                    }
+                    Message::Close(_) => return None,
+                    _ => {}
+                }
+            }
+            None
+        };
+
+        tokio::time::timeout(timeout_duration, fut)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn get_available_shares_up_to_price(
+        &self,
+        token_id_str: &str,
+        limit_price: f64,
+    ) -> Option<f64> {
+        let url = format!("{}/book?token_id={}", self.clob_api_base, token_id_str);
+        let body = self.http.get(&url).send().await.ok()?.text().await.ok()?;
+        calculate_available_shares_up_to_price(&body, limit_price)
     }
 
     /// Ordre limite GTC au prix `best_ask + LIMIT_PRICE_OFFSET`.
@@ -554,22 +804,39 @@ impl PolymarketClient {
         let sdk_client_ms = t0.elapsed().as_millis();
 
         let truncated_usdc = (effective_usdc * 100.0).floor() / 100.0;
-        let amount = Decimal::from_str(&format!("{:.2}", truncated_usdc))
-            .map_err(|e| anyhow!("montant Decimal invalide: {}", e))?;
+        let available_usdc = self.get_usdc_balance().await?;
+        validate_sufficient_usdc_balance(truncated_usdc, available_usdc)?;
 
-        let price_decimal = Decimal::from_str(&format!("{:.4}", limit_price))
+        let size_shares = truncated_usdc / limit_price;
+        let size_decimal = Decimal::from_str(&format!("{:.2}", size_shares))
+            .map_err(|e| anyhow!("taille Decimal invalide: {}", e))?;
+        let price_decimal = Decimal::from_str(&format!("{:.2}", limit_price))
             .map_err(|e| anyhow!("prix limite Decimal invalide: {}", e))?;
+
+        if let Some(available_shares) = self
+            .get_available_shares_up_to_price(token_id_str, limit_price)
+            .await
+        {
+            if available_shares + 0.000_001 < quote.expected_shares.max(min_size) {
+                warn!(
+                    "[LIMIT] profondeur immediate faible | token={} available_shares={:.2} required_shares={:.2} limit_price={:.4}",
+                    token_id_str,
+                    available_shares,
+                    quote.expected_shares.max(min_size),
+                    limit_price
+                );
+            }
+        }
 
         let token_id_u256 = U256::from_str_radix(token_id_str, 10)
             .map_err(|e| anyhow!("token_id parse U256: {}", e))?;
-
         let t1 = Instant::now();
         let order = client
-            .market_order()
+            .limit_order()
             .token_id(token_id_u256)
-            .amount(Amount::usdc(amount).map_err(|e| anyhow!("Amount::usdc: {}", e))?)
-            .price(price_decimal)
             .side(SdkSide::Buy)
+            .price(price_decimal)
+            .size(size_decimal)
             .order_type(SdkOrderType::GTC)
             .build()
             .await
@@ -590,19 +857,77 @@ impl PolymarketClient {
             .map_err(|e| anyhow!("SDK post_order: {}", e))?;
         let post_ms = t3.elapsed().as_millis();
         let ack_at = Utc::now();
+        let order_id = format!("{:?}", resp.order_id).trim_matches('"').to_string();
+        let status = format!("{:?}", resp.status).trim_matches('"').to_string();
+        let execution_details = self.get_order_execution_details(&order_id).await.ok();
+        let execution_price = execution_details
+            .as_ref()
+            .and_then(OrderExecutionDetails::execution_price_with_source);
 
         info!(
-            "Ordre GTC envoyé | token={} amount={:.2}USDC price={:.4} | book={}ms sdk={}ms build={}ms sign={}ms post={}ms",
-            token_id_str, effective_usdc, limit_price,
+            "Ordre GTC envoye | token={} amount={:.2}USDC limit_price={:.4} executed_price={} executed_price_source={} size_matched={} | book={}ms sdk={}ms build={}ms sign={}ms post={}ms",
+            token_id_str, truncated_usdc, limit_price,
+            execution_price
+                .map(|(price, _)| format!("{:.4}", price))
+                .unwrap_or_else(|| "unknown".to_string()),
+            execution_price
+                .map(|(_, source)| source)
+                .unwrap_or("unavailable"),
+            execution_details
+                .as_ref()
+                .and_then(|details| details.size_matched)
+                .map(|size| format!("{:.4}", size))
+                .unwrap_or_else(|| "unknown".to_string()),
             book_ms, sdk_client_ms, build_ms, sign_ms, post_ms
         );
 
         Ok(OrderResult {
-            order_id: format!("{:?}", resp.order_id).trim_matches('"').to_string(),
-            status: format!("{:?}", resp.status).trim_matches('"').to_string(),
+            order_id,
+            status,
+            amount_usdc: effective_usdc,
+            limit_price: Some(limit_price),
+            execution_price: execution_price.map(|(price, _)| price),
+            execution_price_source: execution_price.map(|(_, source)| source.to_string()),
+            size_matched: execution_details.and_then(|details| details.size_matched),
             submitted_at,
             ack_at,
         })
+    }
+
+    async fn submit_limit_order_with_retry(
+        &self,
+        token_id_str: &str,
+        submitted_at: DateTime<Utc>,
+        amount_usdc: f64,
+        min_size: f64,
+    ) -> Result<OrderResult> {
+        let mut temporary_attempt = 0usize;
+
+        loop {
+            match self
+                .submit_limit_order(token_id_str, submitted_at, amount_usdc, min_size)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e)
+                    if Self::is_clob_temporary_order_error(&e)
+                        && temporary_attempt < CLOB_TEMPORARY_RETRY_DELAYS_SECS.len() =>
+                {
+                    let delay_secs = Self::temporary_order_retry_delay_secs(&e, temporary_attempt);
+                    warn!(
+                        "CLOB temporairement indisponible pour ordre GTC token={} — retry {}/{} dans {}s: {}",
+                        token_id_str,
+                        temporary_attempt + 1,
+                        CLOB_TEMPORARY_RETRY_DELAYS_SECS.len(),
+                        delay_secs,
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    temporary_attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     // ── Helpers privés ────────────────────────────────────────────────────────
@@ -920,6 +1245,9 @@ impl PolymarketClient {
         let amount = Decimal::from_str(&format!("{:.2}", truncated_usdc))
             .map_err(|e| anyhow!("montant Decimal invalide: {}", e))?;
 
+        let available_usdc = self.get_usdc_balance().await?;
+        validate_sufficient_usdc_balance(truncated_usdc, available_usdc)?;
+
         // Prix plafond 0.99 : le CLOB matche au meilleur ask disponible.
         // Évite le fetch de l'order book (~200-250ms) à chaque ordre.
         let max_price =
@@ -927,6 +1255,10 @@ impl PolymarketClient {
 
         let token_id_u256 = U256::from_str_radix(token_id_str, 10)
             .map_err(|e| anyhow!("token_id parse U256: {}", e))?;
+        let order_type = match self.config.market_order_type {
+            MarketOrderType::Fok => SdkOrderType::FOK,
+            MarketOrderType::Fak => SdkOrderType::FAK,
+        };
 
         let t1 = Instant::now();
         let order = client
@@ -935,7 +1267,7 @@ impl PolymarketClient {
             .amount(Amount::usdc(amount).map_err(|e| anyhow!("Amount::usdc: {}", e))?)
             .price(max_price)
             .side(SdkSide::Buy)
-            .order_type(SdkOrderType::FOK)
+            .order_type(order_type)
             .build()
             .await
             .map_err(|e| anyhow!("SDK build market_order: {}", e))?;
@@ -965,6 +1297,11 @@ impl PolymarketClient {
         Ok(OrderResult {
             order_id: format!("{:?}", resp.order_id).trim_matches('"').to_string(),
             status: format!("{:?}", resp.status).trim_matches('"').to_string(),
+            amount_usdc,
+            limit_price: Some(0.99),
+            execution_price: None,
+            execution_price_source: None,
+            size_matched: None,
             submitted_at,
             ack_at,
         })
@@ -976,7 +1313,8 @@ impl PolymarketClient {
         submitted_at: DateTime<Utc>,
         amount_usdc: f64,
     ) -> Result<OrderResult> {
-        let mut attempt = 0usize;
+        let mut fok_attempt = 0usize;
+        let mut temporary_attempt = 0usize;
 
         loop {
             match self
@@ -985,18 +1323,35 @@ impl PolymarketClient {
             {
                 Ok(result) => return Ok(result),
                 Err(e)
-                    if Self::is_fok_unfilled_error(&e) && attempt < FOK_RETRY_DELAYS_SECS.len() =>
+                    if Self::is_clob_temporary_order_error(&e)
+                        && temporary_attempt < CLOB_TEMPORARY_RETRY_DELAYS_SECS.len() =>
                 {
-                    let delay_secs = FOK_RETRY_DELAYS_SECS[attempt];
+                    let delay_secs = Self::temporary_order_retry_delay_secs(&e, temporary_attempt);
+                    warn!(
+                        "CLOB temporairement indisponible pour ordre FOK token={} - retry {}/{} dans {}s: {}",
+                        token_id_str,
+                        temporary_attempt + 1,
+                        CLOB_TEMPORARY_RETRY_DELAYS_SECS.len(),
+                        delay_secs,
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    temporary_attempt += 1;
+                }
+                Err(e)
+                    if Self::is_fok_unfilled_error(&e)
+                        && fok_attempt < FOK_RETRY_DELAYS_SECS.len() =>
+                {
+                    let delay_secs = FOK_RETRY_DELAYS_SECS[fok_attempt];
                     warn!(
                         "Ordre FOK non rempli immédiatement pour token={} — retry {}/{} dans {}s",
                         token_id_str,
-                        attempt + 1,
+                        fok_attempt + 1,
                         FOK_RETRY_DELAYS_SECS.len(),
                         delay_secs
                     );
                     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                    attempt += 1;
+                    fok_attempt += 1;
                 }
                 Err(e) => return Err(e),
             }
@@ -1007,6 +1362,42 @@ impl PolymarketClient {
         let msg = err.to_string().to_ascii_lowercase();
         msg.contains("fok orders are fully filled or killed")
             || msg.contains("order couldn't be fully filled")
+    }
+
+    pub(crate) fn is_clob_temporary_order_error(err: &anyhow::Error) -> bool {
+        let msg = err.to_string().to_ascii_lowercase();
+        msg.contains("425")
+            || msg.contains("too early")
+            || msg.contains("post-only")
+            || msg.contains("post only")
+            || msg.contains("post_only")
+            || msg.contains("retry-after")
+            || msg.contains("temporarily unavailable")
+            || msg.contains("service unavailable")
+            || msg.contains("engine restart")
+            || msg.contains("matching engine")
+    }
+
+    pub(crate) fn temporary_order_retry_delay_secs(err: &anyhow::Error, attempt: usize) -> u64 {
+        let fallback = CLOB_TEMPORARY_RETRY_DELAYS_SECS
+            .get(attempt)
+            .copied()
+            .unwrap_or_else(|| *CLOB_TEMPORARY_RETRY_DELAYS_SECS.last().unwrap_or(&30));
+
+        Self::parse_retry_after_secs(&err.to_string())
+            .map(|secs| secs.clamp(1, MAX_RETRY_AFTER_SECS))
+            .unwrap_or(fallback)
+    }
+
+    pub(crate) fn parse_retry_after_secs(message: &str) -> Option<u64> {
+        let lower = message.to_ascii_lowercase();
+        let (_, tail) = lower.split_once("retry-after")?;
+        let digits: String = tail
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u64>().ok()
     }
 
     pub async fn get_usdc_balance(&self) -> Result<f64> {
@@ -1021,5 +1412,93 @@ impl PolymarketClient {
             .map_err(|e| anyhow!("get_usdc_balance échoué: {}", e))?;
         let raw: f64 = resp.balance.to_string().parse().unwrap_or(0.0);
         Ok((raw / 1_000_000.0 * 100.0).floor() / 100.0)
+    }
+
+    pub async fn get_open_orders(&self, token_id: Option<&str>) -> Result<Vec<OpenOrderSummary>> {
+        let client = self.get_or_create_sdk_client().await?;
+        let mut request = OrdersRequest::builder().build();
+        if let Some(token_id) = token_id {
+            request.asset_id = Some(
+                U256::from_str_radix(token_id, 10)
+                    .map_err(|e| anyhow!("token_id parse U256: {}", e))?,
+            );
+        }
+
+        let page = client
+            .orders(&request, None)
+            .await
+            .map_err(|e| anyhow!("get_open_orders echoue: {}", e))?;
+
+        Ok(page
+            .data
+            .into_iter()
+            .map(|order| OpenOrderSummary {
+                id: order.id,
+                status: format!("{:?}", order.status),
+                asset_id: order.asset_id.to_string(),
+                side: format!("{:?}", order.side),
+                original_size: order.original_size.to_string(),
+                size_matched: order.size_matched.to_string(),
+                price: order.price.to_string(),
+                outcome: order.outcome,
+                order_type: format!("{:?}", order.order_type),
+            })
+            .collect())
+    }
+
+    pub async fn cancel_order(&self, order_id: &str) -> Result<CancelOrderSummary> {
+        if order_id.trim().is_empty() {
+            return Err(anyhow!("order_id requis pour cancel_order"));
+        }
+
+        let client = self.get_or_create_sdk_client().await?;
+        let response = client
+            .cancel_order(order_id)
+            .await
+            .map_err(|e| anyhow!("cancel_order echoue: {}", e))?;
+        let mut not_canceled = response.not_canceled.into_iter().collect::<Vec<_>>();
+        not_canceled.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(CancelOrderSummary {
+            canceled: response.canceled,
+            not_canceled,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PolymarketClient;
+
+    #[test]
+    fn detects_temporary_clob_order_errors() {
+        for message in [
+            "SDK post_order: Status: error(425 Too Early)",
+            "post_only_mode: matching engine restart",
+            "service unavailable retry-after: 12",
+        ] {
+            let err = anyhow::anyhow!(message);
+            assert!(PolymarketClient::is_clob_temporary_order_error(&err));
+        }
+    }
+
+    #[test]
+    fn retry_after_seconds_are_parsed_and_capped() {
+        let err = anyhow::anyhow!("HTTP 425 retry-after: 120");
+
+        assert_eq!(
+            PolymarketClient::temporary_order_retry_delay_secs(&err, 0),
+            60
+        );
+    }
+
+    #[test]
+    fn temporary_retry_uses_fallback_when_retry_after_is_absent() {
+        let err = anyhow::anyhow!("HTTP 425 Too Early");
+
+        assert_eq!(
+            PolymarketClient::temporary_order_retry_delay_secs(&err, 1),
+            15
+        );
     }
 }

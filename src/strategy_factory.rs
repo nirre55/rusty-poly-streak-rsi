@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::config::Config;
 use crate::strategies::btc_15m_rules_18_min_votes_1::BtcRules18;
+use crate::strategies::btc_5m_rules_23_min_votes_1::BtcRules23;
 use crate::strategies::btc_5m_rules_90_min_votes_1::BtcRules90;
 use crate::strategies::eth_15m_rules_24_min_votes_1::EthRules24;
 use crate::strategies::eth_5m_rules_25_min_votes_1::EthRules25;
@@ -15,13 +16,16 @@ pub fn create_strategy(config: &Config) -> Result<Box<dyn Strategy>> {
             config.rsi_oversold,
         ))),
         "btc_5m_rules_90_min_votes_1" => Ok(Box::new(BtcRules90::new(config.ensemble_min_votes))),
+        "btc_5m_rules_23_min_votes_1" => Ok(Box::new(BtcRules23::new(
+            config.ensemble_min_votes,
+        ))),
         "btc_15m_rules_18_min_votes_1" => Ok(Box::new(BtcRules18::new(config.ensemble_min_votes))),
         "eth_5m_rules_25_min_votes_1" => Ok(Box::new(EthRules25::new(config.ensemble_min_votes))),
         "eth_15m_rules_24_min_votes_1" => {
             Ok(Box::new(EthRules24::new(config.ensemble_min_votes)))
         }
         other => anyhow::bail!(
-            "Stratégie '{}' inconnue. Stratégies disponibles: three_candle_rsi7_reversal, btc_5m_rules_90_min_votes_1, btc_15m_rules_18_min_votes_1, eth_5m_rules_25_min_votes_1, eth_15m_rules_24_min_votes_1",
+            "Stratégie '{}' inconnue. Stratégies disponibles: three_candle_rsi7_reversal, btc_5m_rules_90_min_votes_1, btc_5m_rules_23_min_votes_1, btc_15m_rules_18_min_votes_1, eth_5m_rules_25_min_votes_1, eth_15m_rules_24_min_votes_1",
             other
         ),
     }
@@ -30,7 +34,7 @@ pub fn create_strategy(config: &Config) -> Result<Box<dyn Strategy>> {
 #[cfg(test)]
 mod tests {
     use super::create_strategy;
-    use crate::config::{Config, ExecutionMode};
+    use crate::config::{Config, ExecutionMode, MarketOrderType};
 
     fn config_with_strategy(strategy: &str) -> Config {
         Config {
@@ -57,6 +61,7 @@ mod tests {
             excluded_hours: Vec::new(),
             ensemble_min_votes: 1,
             limit_price_offset: 0.01,
+            market_order_type: MarketOrderType::Fok,
         }
     }
 
@@ -65,6 +70,7 @@ mod tests {
         for strategy_name in [
             "three_candle_rsi7_reversal",
             "btc_5m_rules_90_min_votes_1",
+            "btc_5m_rules_23_min_votes_1",
             "btc_15m_rules_18_min_votes_1",
             "eth_5m_rules_25_min_votes_1",
             "eth_15m_rules_24_min_votes_1",

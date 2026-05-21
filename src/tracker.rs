@@ -16,6 +16,8 @@ use crate::polymarket::PolymarketClient;
 use crate::strategy::Prediction;
 
 type PolymarketFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+const MAX_ORDER_STATUS_FAILURES: u32 = 5;
+const STATUS_UNKNOWN: &str = "STATUS_UNKNOWN";
 
 pub trait PolymarketReadClient: Send + Sync {
     fn get_order_status<'a>(&'a self, order_id: &'a str) -> PolymarketFuture<'a, String>;
@@ -52,6 +54,8 @@ struct PendingTrade {
     target_close_time_ms: Option<i64>,
     #[serde(default)]
     order_status: Option<String>,
+    #[serde(default)]
+    status_failures: u32,
     #[serde(default)]
     validation_done: bool,
 }
@@ -131,6 +135,7 @@ impl PositionTracker {
             prediction: Some(prediction),
             target_close_time_ms: Some(target_close_time.timestamp_millis()),
             order_status: Some(order_status),
+            status_failures: 0,
             validation_done: false,
         });
         if let Err(e) = self.save_pending(&pending) {
@@ -163,13 +168,28 @@ impl PositionTracker {
             if trade.validation_done {
                 continue;
             }
-            if trade.target_close_time_ms != Some(candle_close_time.timestamp_millis()) {
+            let Some(target_close_time_ms) = trade.target_close_time_ms else {
+                continue;
+            };
+            if target_close_time_ms > candle_close_time.timestamp_millis() {
                 continue;
             }
 
+            let is_exact_target = target_close_time_ms == candle_close_time.timestamp_millis();
             let outcome = match (&trade.prediction, trade.order_status.as_deref()) {
-                (Some(prediction), Some(status)) if Self::is_filled_status(status) => {
+                (Some(prediction), Some(status))
+                    if Self::is_filled_status(status) && is_exact_target =>
+                {
                     Some(Self::binance_outcome(prediction, candle_is_green))
+                }
+                (Some(_), Some(status)) if Self::is_filled_status(status) => {
+                    warn!(
+                        "[TRACKER] Validation exacte manquée | trade_id={} target_close_time_ms={} current_close_time_ms={}",
+                        trade.trade_id,
+                        target_close_time_ms,
+                        candle_close_time.timestamp_millis()
+                    );
+                    Some("MISSED_VALIDATION".to_string())
                 }
                 (_, Some(status)) if Self::is_non_fill_terminal_status(status) => {
                     Some("NO_ENTRY".to_string())
@@ -179,13 +199,15 @@ impl PositionTracker {
 
             if let Some(outcome) = outcome {
                 if let Err(e) = self.logger.update_outcome(&trade.trade_id, &outcome) {
-                    warn!("[TRACKER] validation Binance échouée: {}", e);
+                    warn!("[TRACKER] mise a jour outcome echouee: {}", e);
                 } else {
                     info!(
-                        "[TRACKER] Validation Binance | trade_id={} outcome={}",
+                        "[TRACKER] Validation Binance estimee | trade_id={} outcome={}",
                         trade.trade_id, outcome
                     );
-                    self.money.lock().await.on_outcome(&outcome);
+                    if matches!(outcome.as_str(), "WIN" | "LOSS" | "NO_ENTRY") {
+                        self.money.lock().await.on_outcome(&outcome);
+                    }
                     if self.trade_amount_pct > 0.0 && matches!(outcome.as_str(), "WIN" | "LOSS") {
                         let client = self.client.clone();
                         let money = self.money.clone();
@@ -254,6 +276,7 @@ impl PositionTracker {
         for mut trade in trades {
             match self.client.get_order_status(&trade.order_id).await {
                 Ok(status) => {
+                    trade.status_failures = 0;
                     let status_changed = trade
                         .order_status
                         .as_deref()
@@ -289,10 +312,32 @@ impl PositionTracker {
                     still_pending.push(trade);
                 }
                 Err(e) => {
-                    warn!(
-                        "[TRACKER] get_order_status({}) failed: {}",
-                        trade.order_id, e
-                    );
+                    trade.status_failures = trade.status_failures.saturating_add(1);
+                    if trade.status_failures >= MAX_ORDER_STATUS_FAILURES {
+                        warn!(
+                            "[TRACKER] get_order_status({}) failed {} fois; statut marque {}: {}",
+                            trade.order_id, trade.status_failures, STATUS_UNKNOWN, e
+                        );
+                        if let Err(update_err) = self
+                            .logger
+                            .update_order_status(&trade.trade_id, STATUS_UNKNOWN)
+                        {
+                            warn!("[TRACKER] update_order_status failed: {}", update_err);
+                        }
+                        if let Err(update_err) =
+                            self.logger.update_outcome(&trade.trade_id, STATUS_UNKNOWN)
+                        {
+                            warn!("[TRACKER] update_outcome failed: {}", update_err);
+                        } else {
+                            trade.order_status = Some(STATUS_UNKNOWN.to_string());
+                            trade.validation_done = true;
+                        }
+                    } else {
+                        warn!(
+                            "[TRACKER] get_order_status({}) failed ({}/{}): {}",
+                            trade.order_id, trade.status_failures, MAX_ORDER_STATUS_FAILURES, e
+                        );
+                    }
                     still_pending.push(trade);
                 }
             }
@@ -343,7 +388,9 @@ impl PositionTracker {
     }
 
     fn is_terminal_status(status: &str) -> bool {
-        Self::is_filled_status(status) || Self::is_non_fill_terminal_status(status)
+        Self::is_filled_status(status)
+            || Self::is_non_fill_terminal_status(status)
+            || status.eq_ignore_ascii_case(STATUS_UNKNOWN)
     }
 
     fn can_drop_trade(trade: &PendingTrade) -> bool {

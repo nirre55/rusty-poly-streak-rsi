@@ -23,6 +23,7 @@ Le projet supporte plusieurs stratégies configurables, le dry-run, les ordres r
 |---|---|---|
 | `three_candle_rsi7_reversal` | BTC 5m | Reversal après 3 bougies de même couleur + RSI7 + filtres range/body. |
 | `btc_5m_rules_90_min_votes_1` | BTC 5m | Ensemble de 90 micro-règles. |
+| `btc_5m_rules_23_min_votes_1` | BTC 5m | Ensemble combine de 23 micro-strategies, `min_votes=1`. |
 | `btc_15m_rules_18_min_votes_1` | BTC 15m | Ensemble de 18 micro-règles. |
 | `eth_5m_rules_25_min_votes_1` | ETH 5m | Ensemble de 25 micro-règles. |
 | `eth_15m_rules_24_min_votes_1` | ETH 15m | Ensemble de 24 micro-règles. |
@@ -112,6 +113,47 @@ Fichiers produits :
 | `money_state.json` | État du money management. |
 
 Les fichiers CSV et JSON runtime sous `logs/` sont ignorés par Git.
+
+## Reconciliation officielle Polymarket
+
+Le bot valide les trades en live avec la bougie Binance cible afin de continuer a trader sans attendre la resolution officielle Polymarket. Cette validation est rapide, mais elle reste une estimation operationnelle: les marches Up/Down Polymarket se resolvent selon la source indiquee dans leurs regles, souvent Chainlink.
+
+Le binaire `reconcile_outcomes` sert d'audit quotidien. Il lit `trades.csv`, extrait les slugs `btc-updown-*` et `eth-updown-*`, recupere le marche via Gamma, puis recupere le token gagnant officiel via le CLOB Polymarket. Il ecrit ensuite un rapport append-only dans `reconciliation_report.csv`.
+
+Le script ne modifie pas `trades.csv` et ne change pas `money_state.json`. Il signale seulement les ecarts entre le resultat Binance utilise en live et le resultat officiel Polymarket.
+
+Colonnes principales du rapport :
+
+| Colonne | Role |
+|---|---|
+| `prediction` | Prediction du bot (`UP` ou `DOWN`). |
+| `binance_outcome` | Resultat enregistre en live dans `trades.csv`. |
+| `official_winner` | Outcome gagnant selon Polymarket (`UP` ou `DOWN`). |
+| `official_outcome` | Resultat officiel calcule pour notre prediction. |
+| `reconciliation` | `MATCH`, `MISMATCH`, `PENDING` ou `ERROR`. |
+
+Execution Windows PowerShell :
+
+```powershell
+.\reconcile_outcomes.ps1
+.\reconcile_outcomes.ps1 configs/eth_ensemble.env
+.\reconcile_outcomes.ps1 configs/btc_ensemble.env -Release
+```
+
+Execution Linux/macOS :
+
+```bash
+chmod +x ./reconcile_outcomes.sh
+./reconcile_outcomes.sh
+./reconcile_outcomes.sh configs/eth_ensemble.env
+RELEASE=1 ./reconcile_outcomes.sh configs/btc_ensemble.env
+```
+
+Execution directe Cargo :
+
+```bash
+STRATEGY_CONFIG=configs/btc_ensemble.env cargo run --locked --bin reconcile_outcomes
+```
 
 ## Tests et qualité
 

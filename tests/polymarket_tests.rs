@@ -1,8 +1,9 @@
 use chrono::Utc;
-use rusty_poly_streak_rsi::config::{Config, ExecutionMode};
+use rusty_poly_streak_rsi::config::{Config, ExecutionMode, MarketOrderType};
 use rusty_poly_streak_rsi::polymarket::{
-    calculate_limit_order_quote, parse_best_ask_body, parse_gamma_market_body, MarketInfo,
-    PolymarketClient,
+    calculate_available_shares_up_to_price, calculate_limit_order_quote, parse_best_ask_body,
+    parse_gamma_market_body, parse_market_ws_best_ask_message, parse_order_execution_details_body,
+    parse_order_status_body, validate_sufficient_usdc_balance, MarketInfo, PolymarketClient,
 };
 use rusty_poly_streak_rsi::strategy::{Prediction, Signal};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,6 +34,7 @@ fn make_config(mode: ExecutionMode) -> Config {
         excluded_hours: Vec::new(),
         ensemble_min_votes: 1,
         limit_price_offset: 0.01,
+        market_order_type: MarketOrderType::Fok,
     }
 }
 
@@ -151,8 +153,96 @@ fn test_parse_best_ask_body_returns_first_ask_price() {
 }
 
 #[test]
+fn test_parse_best_ask_body_returns_lowest_ask_price() {
+    let body = r#"{"asks":[{"price":"0.99"},{"price":"0.52"},{"price":"0.51"}]}"#;
+
+    assert_eq!(parse_best_ask_body(body), Some(0.51));
+}
+
+#[test]
 fn test_parse_best_ask_body_returns_none_for_empty_book() {
     assert_eq!(parse_best_ask_body(r#"{"asks":[]}"#), None);
+}
+
+#[test]
+fn test_parse_market_ws_best_ask_message_supports_best_bid_ask() {
+    let body = r#"{
+        "event_type":"best_bid_ask",
+        "asset_id":"token-up",
+        "best_bid":"0.50",
+        "best_ask":"0.53"
+    }"#;
+
+    assert_eq!(
+        parse_market_ws_best_ask_message("token-up", body),
+        Some(0.53)
+    );
+}
+
+#[test]
+fn test_parse_market_ws_best_ask_message_supports_book_snapshot() {
+    let body = r#"{
+        "event_type":"book",
+        "asset_id":"token-up",
+        "asks":[{"price":"0.55"},{"price":"0.52"}]
+    }"#;
+
+    assert_eq!(
+        parse_market_ws_best_ask_message("token-up", body),
+        Some(0.52)
+    );
+}
+
+#[test]
+fn test_parse_market_ws_best_ask_message_supports_price_change() {
+    let body = r#"{
+        "event_type":"price_change",
+        "price_changes":[
+            {"asset_id":"token-down","best_ask":"0.60"},
+            {"asset_id":"token-up","best_ask":"0.51"}
+        ]
+    }"#;
+
+    assert_eq!(
+        parse_market_ws_best_ask_message("token-up", body),
+        Some(0.51)
+    );
+}
+
+#[test]
+fn test_parse_order_status_body_supports_nested_and_array_shapes() {
+    assert_eq!(
+        parse_order_status_body(r#"{"status":"matched"}"#).unwrap(),
+        "matched"
+    );
+    assert_eq!(
+        parse_order_status_body(r#"{"order":{"status":"filled"}}"#).unwrap(),
+        "filled"
+    );
+    assert_eq!(
+        parse_order_status_body(r#"[{"status":"cancelled"}]"#).unwrap(),
+        "cancelled"
+    );
+}
+
+#[test]
+fn test_parse_order_execution_details_body_extracts_price_fields() {
+    let details = parse_order_execution_details_body(
+        r#"{"order":{"status":"matched","price":"0.52","average_price":"0.51","size_matched":"5"}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(details.status, "matched");
+    assert_eq!(details.order_price, Some(0.52));
+    assert_eq!(details.average_price, Some(0.51));
+    assert_eq!(details.size_matched, Some(5.0));
+}
+
+#[test]
+fn test_parse_order_status_body_rejects_missing_status_with_context() {
+    let err = parse_order_status_body(r#"{"id":"order"}"#).unwrap_err();
+
+    assert!(err.to_string().contains("order status absent"));
 }
 
 #[test]
@@ -171,6 +261,34 @@ fn test_calculate_limit_order_quote_adjusts_to_min_size() {
     assert_eq!(quote.limit_price, 0.41000000000000003);
     assert_eq!(quote.effective_usdc, 2.06);
     assert!(quote.adjusted_to_min_size);
+}
+
+#[test]
+fn test_calculate_available_shares_up_to_price_sums_fillable_depth() {
+    let body = r#"{
+        "asks":[
+            {"price":"0.50","size":"2.5"},
+            {"price":"0.51","size":"3.0"},
+            {"price":"0.55","size":"10.0"}
+        ]
+    }"#;
+
+    assert_eq!(
+        calculate_available_shares_up_to_price(body, 0.51),
+        Some(5.5)
+    );
+}
+
+#[test]
+fn test_validate_sufficient_usdc_balance_rejects_min_order_above_balance() {
+    let err = validate_sufficient_usdc_balance(4.95, 2.27).unwrap_err();
+
+    assert!(err.to_string().contains("solde USDC insuffisant"));
+}
+
+#[test]
+fn test_validate_sufficient_usdc_balance_accepts_available_balance() {
+    assert!(validate_sufficient_usdc_balance(4.95, 4.95).is_ok());
 }
 
 // --- place_order ---

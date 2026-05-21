@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use rusty_poly_streak_rsi::binance::Candle;
-use rusty_poly_streak_rsi::config::{Config, ExecutionMode};
+use rusty_poly_streak_rsi::config::{Config, ExecutionMode, MarketOrderType};
 use rusty_poly_streak_rsi::logger::{TradeLogger, TradeRecord};
 use rusty_poly_streak_rsi::money::MoneyManager;
 use rusty_poly_streak_rsi::polymarket::PolymarketClient;
@@ -46,6 +46,7 @@ fn make_config(logs_dir: &str) -> Config {
         excluded_hours: Vec::new(),
         ensemble_min_votes: 1,
         limit_price_offset: 0.01,
+        market_order_type: MarketOrderType::Fok,
     }
 }
 
@@ -103,6 +104,23 @@ impl PolymarketReadClient for MockPolymarketClient {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<f64>> + Send + 'a>> {
         Box::pin(async move { Ok(self.balance) })
+    }
+}
+
+struct FailingPolymarketClient;
+
+impl PolymarketReadClient for FailingPolymarketClient {
+    fn get_order_status<'a>(
+        &'a self,
+        _order_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        Box::pin(async move { Err(anyhow::anyhow!("mock status endpoint failure")) })
+    }
+
+    fn get_usdc_balance<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<f64>> + Send + 'a>> {
+        Box::pin(async move { Ok(10.0) })
     }
 }
 
@@ -263,6 +281,76 @@ async fn test_tracker_poll_once_updates_terminal_order_status_with_mock_client()
     let content = fs::read_to_string(dir.join("trades.csv")).unwrap();
     assert!(content.contains("matched"));
     assert_eq!(tracker.pending_count().await, 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn test_tracker_marks_past_target_as_missed_validation() {
+    let dir = tmp_dir("missed_validation");
+    fs::create_dir_all(&dir).unwrap();
+    let logger = Arc::new(TradeLogger::new(dir.to_str().unwrap()).unwrap());
+    let client = Arc::new(MockPolymarketClient::new(["matched"]));
+
+    let money = make_money(&dir);
+    let tracker = PositionTracker::new(client, logger.clone(), money, dir.to_str().unwrap(), 0.0);
+    let target_close_time = Utc::now() - Duration::minutes(10);
+    logger
+        .log_trade(&make_record("trade-1", "signal-1", "UP"))
+        .unwrap();
+    tracker
+        .track(
+            "trade-1".to_string(),
+            "order-1".to_string(),
+            "signal-1".to_string(),
+            Prediction::Up,
+            target_close_time,
+            "Matched".to_string(),
+        )
+        .await;
+
+    let later_candle = make_candle(Utc::now(), 100.0, 110.0);
+    tracker
+        .validate_with_closed_candle(later_candle.close_time, later_candle.is_green())
+        .await;
+
+    let content = fs::read_to_string(dir.join("trades.csv")).unwrap();
+    assert!(content.contains("MISSED_VALIDATION"));
+    assert_eq!(tracker.pending_count().await, 0);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn test_tracker_marks_unknown_after_repeated_status_failures() {
+    let dir = tmp_dir("status_unknown");
+    fs::create_dir_all(&dir).unwrap();
+    let logger = Arc::new(TradeLogger::new(dir.to_str().unwrap()).unwrap());
+    let client = Arc::new(FailingPolymarketClient);
+
+    let money = make_money(&dir);
+    let tracker = PositionTracker::new(client, logger.clone(), money, dir.to_str().unwrap(), 0.0);
+    logger
+        .log_trade(&make_record("trade-1", "signal-1", "UP"))
+        .unwrap();
+    tracker
+        .track(
+            "trade-1".to_string(),
+            "order-1".to_string(),
+            "signal-1".to_string(),
+            Prediction::Up,
+            Utc::now() + Duration::minutes(5),
+            "LIVE".to_string(),
+        )
+        .await;
+
+    for _ in 0..5 {
+        tracker.poll_once().await.unwrap();
+    }
+
+    let content = fs::read_to_string(dir.join("trades.csv")).unwrap();
+    assert!(content.contains("STATUS_UNKNOWN"));
+    assert_eq!(tracker.pending_count().await, 0);
 
     fs::remove_dir_all(&dir).ok();
 }

@@ -1,4 +1,4 @@
-use rusty_poly_streak_rsi::config::ExecutionMode;
+use rusty_poly_streak_rsi::config::{ExecutionMode, MarketOrderType};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -13,6 +13,32 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[test]
+fn test_config_parses_market_order_type_fak() {
+    let _guard = env_lock();
+    clear_config_env();
+    std::env::set_var("EXECUTION_MODE", "dry-run");
+    std::env::set_var("TRADE_AMOUNT_PCT", "0");
+    std::env::set_var("TRADE_AMOUNT_USDC", "10");
+    std::env::set_var("MARKET_ORDER_TYPE", "fak");
+    let config = rusty_poly_streak_rsi::config::Config::from_env().unwrap();
+    assert_eq!(config.market_order_type, MarketOrderType::Fak);
+    clear_config_env();
+}
+
+#[test]
+fn test_config_rejects_unknown_market_order_type() {
+    let _guard = env_lock();
+    clear_config_env();
+    std::env::set_var("EXECUTION_MODE", "dry-run");
+    std::env::set_var("TRADE_AMOUNT_PCT", "0");
+    std::env::set_var("TRADE_AMOUNT_USDC", "10");
+    std::env::set_var("MARKET_ORDER_TYPE", "ioc");
+    let err = rusty_poly_streak_rsi::config::Config::from_env().unwrap_err();
+    assert!(err.to_string().contains("MARKET_ORDER_TYPE"));
+    clear_config_env();
+}
+
 fn clear_config_env() {
     for key in [
         "EXECUTION_MODE",
@@ -21,6 +47,7 @@ fn clear_config_env() {
         "EXCLUDED_DAYS",
         "EXCLUDED_HOURS",
         "LIMIT_PRICE_OFFSET",
+        "MARKET_ORDER_TYPE",
         "SYMBOL",
         "INTERVAL",
         "POLYMARKET_API_KEY",
